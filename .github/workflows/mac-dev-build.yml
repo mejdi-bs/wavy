@@ -1,0 +1,53 @@
+# Fork-only: unsigned (ad-hoc) macOS arm64 build named "Wave Dev" for local testing.
+name: Mac Dev Build
+on:
+    workflow_dispatch:
+    push:
+        branches:
+            - feat/**
+env:
+    NODE_VERSION: 22
+    NODE_OPTIONS: --max-old-space-size=4096
+jobs:
+    build-mac:
+        runs-on: macos-latest
+        timeout-minutes: 90
+        steps:
+            - uses: actions/checkout@v5
+            - uses: actions/setup-go@v6
+              with:
+                  go-version-file: go.mod
+                  cache-dependency-path: go.sum
+            - uses: actions/setup-node@v6
+              with:
+                  node-version: ${{ env.NODE_VERSION }}
+                  cache: npm
+                  cache-dependency-path: package-lock.json
+            - name: Force git deps to HTTPS
+              run: |
+                  git config --global url.https://github.com/.insteadof ssh://git@github.com/
+                  git config --global url.https://github.com/.insteadof git@github.com:
+            - name: npm ci
+              run: npm ci --no-audit --no-fund
+            - name: Install Task
+              uses: arduino/setup-task@v2
+              with:
+                  version: 3.x
+                  repo-token: ${{ secrets.GITHUB_TOKEN }}
+            - name: Rename to "Wave Dev" (coexists with official Wave)
+              run: |
+                  node -e '
+                    const fs=require("fs");const p=JSON.parse(fs.readFileSync("package.json"));
+                    p.productName="Wave Dev";p.build=p.build||{};p.build.appId="dev.commandline.waveterm.dev";
+                    fs.writeFileSync("package.json",JSON.stringify(p,null,4)+"\n");'
+                  grep -E '"productName"|"appId"' package.json
+            - name: Build (arm64 dmg, ad-hoc signed, no notarization)
+              run: task package -- --mac dmg --arm64 -c.mac.identity=- -c.mac.notarize=false
+              env:
+                  CSC_IDENTITY_AUTO_DISCOVERY: "false"
+            - name: Upload dmg
+              uses: actions/upload-artifact@v5
+              with:
+                  name: wave-dev-mac-arm64
+                  path: make/*.dmg
+                  retention-days: 14
