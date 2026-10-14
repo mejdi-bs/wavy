@@ -40,8 +40,11 @@ import { boundNumber, fireAndForget, stringToBase64 } from "@/util/util";
 import * as jotai from "jotai";
 import * as React from "react";
 import { getBlockingCommand } from "./shellblocking";
-import { computeTheme, DefaultTermTheme, isLikelyOnSameHost, trimTerminalSelection } from "./termutil";
+import { bufferLinesToText, computeTheme, DefaultTermTheme, isLikelyOnSameHost, trimTerminalSelection } from "./termutil";
 import { TermWrap, WebGLSupported } from "./termwrap";
+import { extractCommands, type DetectedCommand } from "./cmd-extract";
+
+const MaxCmdExtractScanLines = 5000;
 
 export class TermViewModel implements ViewModel {
     viewType: string;
@@ -84,6 +87,7 @@ export class TermViewModel implements ViewModel {
     termDurableStatus: jotai.Atom<BlockJobStatusData | null>;
     termConfigedDurable: jotai.Atom<null | boolean>;
     searchAtoms?: SearchAtoms;
+    showCmdExtractAtom: jotai.PrimitiveAtom<boolean>;
 
     constructor({ blockId, nodeModel, tabModel }: ViewModelInitType) {
         this.viewType = "term";
@@ -107,6 +111,7 @@ export class TermViewModel implements ViewModel {
             return blockData?.meta?.["term:mode"] ?? "term";
         });
         this.isRestarting = jotai.atom(false);
+        this.showCmdExtractAtom = jotai.atom(false);
         this.viewIcon = jotai.atom((get) => {
             const termMode = get(this.termMode);
             if (termMode == "vdom") {
@@ -299,6 +304,15 @@ export class TermViewModel implements ViewModel {
                     rtn.push(webglButton);
                 }
             }
+
+            rtn.push({
+                elemtype: "iconbutton",
+                icon: "clipboard-list",
+                title: "Detected Commands",
+                click: () => {
+                    globalStore.set(this.showCmdExtractAtom, true);
+                },
+            });
 
             if (blockData?.meta?.["controller"] != "cmd" && shellProcStatus != "done") {
                 return rtn;
@@ -822,6 +836,17 @@ export class TermViewModel implements ViewModel {
         });
     }
 
+    getDetectedCommands(): DetectedCommand[] {
+        const termWrap = this.termRef.current;
+        if (termWrap == null || termWrap.terminal.buffer.active.type != "normal") {
+            return [];
+        }
+        const buffer = termWrap.terminal.buffer.active;
+        const start = Math.max(0, buffer.length - MaxCmdExtractScanLines);
+        const lines = bufferLinesToText(buffer, start, buffer.length);
+        return extractCommands(lines);
+    }
+
     getContextMenuItems(): ContextMenuItem[] {
         const menu: ContextMenuItem[] = [];
         const hasSelection = this.termRef.current?.terminal?.hasSelection();
@@ -893,6 +918,15 @@ export class TermViewModel implements ViewModel {
             label: "Paste",
             click: () => {
                 getApi().nativePaste();
+            },
+        });
+
+        menu.push({ type: "separator" });
+
+        menu.push({
+            label: "Copy Detected Commands...",
+            click: () => {
+                globalStore.set(this.showCmdExtractAtom, true);
             },
         });
 
