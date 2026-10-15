@@ -852,7 +852,7 @@ export class TermViewModel implements ViewModel {
         const buffer = termWrap.terminal.buffer.active;
         const start = Math.max(0, buffer.length - MaxCmdExtractScanLines);
         const lines = bufferLinesToText(buffer, start, buffer.length);
-        return extractCommands(lines);
+        return extractCommands(lines, { cols: termWrap.terminal.cols });
     }
 
     getContextMenuItems(): ContextMenuItem[] {

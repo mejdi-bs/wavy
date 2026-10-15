@@ -9,7 +9,6 @@ import type * as TermTypes from "@xterm/xterm";
 // alternate buffer has no scrollback).
 const ContextRows = 40;
 const BoxPadPx = 4;
-const ButtonSpacePx = 26;
 
 export type ViewportText = {
     lines: string[];
@@ -24,6 +23,8 @@ export type HoverBox = {
     top: number;
     width: number;
     height: number;
+    rowHeight: number;
+    screenRight: number;
 };
 
 export function readViewportText(buffer: TermTypes.IBuffer, viewportY: number, rows: number): ViewportText {
@@ -60,8 +61,10 @@ function occurrenceRows(text: ViewportText, occ: CommandOccurrence): [number, nu
 
 // Columns are string offsets from translateToString, which matches cells for
 // everything except wide (CJK/emoji) glyphs; close enough for a highlight box.
+// TUIs pad their lines with real spaces up to the full width, which xterm
+// does not trim, so trailing whitespace is dropped here.
 function rowExtent(buffer: TermTypes.IBuffer, row: number): [number, number] | null {
-    const rowText = buffer.getLine(row)?.translateToString(true) ?? "";
+    const rowText = (buffer.getLine(row)?.translateToString(true) ?? "").trimEnd();
     const startCol = rowText.length - rowText.trimStart().length;
     if (startCol >= rowText.length) {
         return null;
@@ -133,13 +136,15 @@ export function computeBox(
         return null;
     }
     const left = Math.max(screenRect.left, screenRect.left + startCol * cellW - BoxPadPx);
-    const right = Math.min(screenRect.right, screenRect.left + endCol * cellW + BoxPadPx + ButtonSpacePx);
+    const right = Math.min(screenRect.right, screenRect.left + endCol * cellW + BoxPadPx);
     return {
         command: occ.command,
         left,
         top: screenRect.top + (visFirst - viewportY) * cellH,
         width: right - left,
         height: (visLast - visFirst + 1) * cellH,
+        rowHeight: cellH,
+        screenRight: screenRect.right,
     };
 }
 

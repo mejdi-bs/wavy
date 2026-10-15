@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 
 import { cleanCommandLine, commandsToCopyText, extractCommands, scanCommands } from "./cmd-extract";
@@ -39,6 +40,13 @@ describe("cleanCommandLine", () => {
 });
 
 describe("extractCommands plain detection", () => {
+    it("looks past wrapper options to find the real command", () => {
+        expect(commandsOf(["watch -n 2 'kubectl get pods -A'"])).toEqual(["watch -n 2 'kubectl get pods -A'"]);
+        expect(commandsOf(["sudo -u postgres psql -c 'select 1'"])).toEqual(["sudo -u postgres psql -c 'select 1'"]);
+        expect(commandsOf(["timeout 5s curl -s https://x"])).toEqual(["timeout 5s curl -s https://x"]);
+        expect(commandsOf(["env -i bash --norc"])).toEqual(["env -i bash --norc"]);
+    });
+
     it("detects plain command lines", () => {
         expect(commandsOf(["kubectl get pods"])).toEqual(["kubectl get pods"]);
         expect(commandsOf(["ssh user@host"])).toEqual(["ssh user@host"]);
@@ -262,6 +270,80 @@ describe("extractCommands compound commands", () => {
     });
 });
 
+describe("extractCommands TUI soft wrap", () => {
+    it("rejoins a flag that the TUI wrapped onto the next line", () => {
+        const lines = ["```bash", "  kubectl top pods -A", "--sort-by=cpu", "```"];
+        expect(commandsOf(lines)).toEqual(["kubectl top pods -A --sort-by=cpu"]);
+        expect(scanCommands(lines)[0].endLineIndex).toBe(2);
+    });
+
+    it("rejoins a tail that did not fit in the terminal width", () => {
+        const lines = ["kubectl get pods --all-namespaces -o", "wide", "", "Next step"];
+        expect(extractCommands(lines, { cols: 40 }).map((c) => c.command)).toEqual([
+            "kubectl get pods --all-namespaces -o wide",
+        ]);
+        expect(extractCommands(lines, { cols: 80 }).map((c) => c.command)).toEqual([
+            "kubectl get pods --all-namespaces -o",
+        ]);
+    });
+
+    it("rejoins a wrapped command until its quote closes", () => {
+        const lines = [
+            "```bash",
+            "  watch -n 2 'kubectl get pods",
+            "-A -o wide; echo; kubectl top",
+            "pods -A --containers",
+            "--sort-by=memory'",
+            "```",
+        ];
+        expect(extractCommands(lines, { cols: 34 }).map((c) => c.command)).toEqual([
+            "watch -n 2 'kubectl get pods -A -o wide; echo; kubectl top pods -A --containers --sort-by=memory'",
+        ]);
+    });
+
+    it("keeps a quoted multi-line script together, blank lines included", () => {
+        const lines = [
+            "```bash",
+            "  watch -n 2 '",
+            "    clear",
+            '    echo "=== PODS ==="',
+            "    kubectl get pods \\",
+            "      --all-namespaces",
+            "",
+            "    echo",
+            "    kubectl top nodes",
+            "  '",
+            "```",
+            "  Ensuite :",
+        ];
+        const results = scanCommands(lines);
+        expect(results.length).toBe(1);
+        expect(results[0].command).toBe(
+            "watch -n 2 '\n  clear\n  echo \"=== PODS ===\"\n  kubectl get pods \\\n    --all-namespaces\n\n  echo\n  kubectl top nodes\n'"
+        );
+        expect(results[0].lineIndex).toBe(1);
+        expect(results[0].endLineIndex).toBe(9);
+    });
+
+    it("rejoins an indented command whose tail wrapped to column 0", () => {
+        const lines = ["  kubectl get pods --all-namespaces", "wide", "", "Next"];
+        expect(commandsOf(lines)).toEqual(["kubectl get pods --all-namespaces wide"]);
+    });
+
+    it("does not swallow a following command or prose", () => {
+        expect(
+            extractCommands(["kubectl get pods -A -o wide --show-labels", "helm list"], { cols: 40 }).map(
+                (c) => c.command
+            )
+        ).toEqual(["kubectl get pods -A -o wide --show-labels", "helm list"]);
+        expect(
+            extractCommands(["kubectl get pods -A -o wide --show-labels", "then check the output."], { cols: 40 }).map(
+                (c) => c.command
+            )
+        ).toEqual(["kubectl get pods -A -o wide --show-labels"]);
+    });
+});
+
 describe("scanCommands", () => {
     it("reports every occurrence with its line range", () => {
         const lines = ["$ kubectl get pods", "output", "docker run \\", "  nginx", "kubectl get pods"];
@@ -270,6 +352,76 @@ describe("scanCommands", () => {
             { command: "docker run \\\n  nginx", lineIndex: 2, endLineIndex: 3, inFence: false },
             { command: "kubectl get pods", lineIndex: 4, endLineIndex: 4, inFence: false },
         ]);
+    });
+});
+
+function bashSyntaxError(script: string): string | null {
+    try {
+        execFileSync("bash", ["-n"], { input: script, stdio: ["pipe", "pipe", "pipe"] });
+        return null;
+    } catch (e: any) {
+        return e?.stderr?.toString() || String(e);
+    }
+}
+
+describe("copied commands are shell-clean", () => {
+    it("normalizes non-breaking spaces, zero-width marks and curly quotes", () => {
+        expect(commandsOf(["kubectl\u00a0get\u00a0pods\u200b -A"])).toEqual(["kubectl get pods -A"]);
+        expect(commandsOf(["echo \u201chello\u201d"])).toEqual(['echo "hello"']);
+        expect(commandsOf(["watch -n 2 \u2018kubectl get pods\u2019"])).toEqual(["watch -n 2 'kubectl get pods'"]);
+    });
+
+    it("strips line-number gutters and Windows prompts", () => {
+        expect(commandsOf(["  12 │ kubectl get pods"])).toEqual(["kubectl get pods"]);
+        expect(commandsOf(["     3\tkubectl get pods"])).toEqual(["kubectl get pods"]);
+        expect(commandsOf(["PS C:\\Users\\me> kubectl get pods"])).toEqual(["kubectl get pods"]);
+        expect(commandsOf(["C:\\Users\\me> git status"])).toEqual(["git status"]);
+    });
+
+    it("strips the secondary prompt from continuation lines", () => {
+        expect(commandsOf(["$ docker run \\", "> -e FOO=bar \\", "> nginx"])).toEqual([
+            "docker run \\\n-e FOO=bar \\\nnginx",
+        ]);
+        expect(commandsOf(["for f in *.txt; do", ">   echo $f", "> done"])).toEqual([
+            "for f in *.txt; do\n  echo $f\ndone",
+        ]);
+    });
+
+    it("never leaves whitespace after a line continuation backslash", () => {
+        const [cmd] = commandsOf(["  docker run \\   ", "    nginx:latest   "]);
+        expect(cmd).toBe("docker run \\\n  nginx:latest");
+    });
+
+    const bashAvailable = process.platform != "win32" && bashSyntaxError("true") == null;
+    it.skipIf(!bashAvailable)("produces scripts that bash accepts", () => {
+        const samples: string[][] = [
+            ["$ kubectl get pods -A | grep -v Running"],
+            ["user@mac ~/wave % git log --oneline -5"],
+            ["│ ❯ docker run \\", "│   -e FOO=bar \\", "│   nginx:latest"],
+            ["kubectl config get-contexts -o name | while read ctx; do", '  echo "=== $ctx ==="', "done"],
+            ["if [ -f .env ]; then", "  source .env", "fi"],
+            [
+                "  watch -n 2 '",
+                "    clear",
+                '    echo "=== PODS ==="',
+                "    kubectl get pods \\",
+                "      -A",
+                "",
+                "  '",
+            ],
+            ["Run \u2018kubectl get pods -A\u2019 then `helm list`"],
+            ["$ docker run \\", "> -e FOO=bar \\", "> nginx"],
+            ["```bash", "  kubectl top pods -A", "--sort-by=cpu", "```"],
+            ['echo "a: b" > file.yml && cat file.yml'],
+            ["FOO=bar npm run build -- --watch"],
+        ];
+        for (const lines of samples) {
+            const cmds = commandsOf(lines);
+            expect(cmds.length, lines.join("\\n")).toBeGreaterThan(0);
+            for (const cmd of cmds) {
+                expect(bashSyntaxError(cmd), cmd).toBeNull();
+            }
+        }
     });
 });
 

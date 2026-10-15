@@ -10,6 +10,11 @@ export type DetectedCommand = {
     count: number;
 };
 
+export type ScanOptions = {
+    // terminal width, used to recognize lines soft-wrapped by a TUI
+    cols?: number;
+};
+
 export type CommandOccurrence = {
     command: string;
     lineIndex: number;
@@ -19,6 +24,8 @@ export type CommandOccurrence = {
 
 const MaxCommands = 50;
 const MaxContinuationLines = 15;
+// A quoted script (`watch -n 2 '...'`) can legitimately span many lines.
+const MaxQuotedLines = 80;
 const MaxTokens = 30;
 const MaxCommandLength = 500;
 
@@ -26,49 +33,257 @@ const MaxCommandLength = 500;
 // first token (after wrappers/env assignments are stripped).
 const KNOWN_COMMANDS = new Set([
     // containers / k8s
-    "kubectl", "k3s", "oc", "helm", "helmfile", "kustomize", "minikube", "kind", "k9s", "stern",
-    "istioctl", "argocd", "flux", "skaffold", "tilt", "kompose", "podman", "docker", "nerdctl",
-    "buildah", "skopeo", "crane", "dive", "trivy",
+    "kubectl",
+    "k3s",
+    "oc",
+    "helm",
+    "helmfile",
+    "kustomize",
+    "minikube",
+    "kind",
+    "k9s",
+    "stern",
+    "istioctl",
+    "argocd",
+    "flux",
+    "skaffold",
+    "tilt",
+    "kompose",
+    "podman",
+    "docker",
+    "nerdctl",
+    "buildah",
+    "skopeo",
+    "crane",
+    "dive",
+    "trivy",
     // cloud / hosting
-    "aws", "gcloud", "az", "doctl", "flyctl", "heroku", "netlify", "vercel", "sam", "pulumi",
+    "aws",
+    "gcloud",
+    "az",
+    "doctl",
+    "flyctl",
+    "heroku",
+    "netlify",
+    "vercel",
+    "sam",
+    "pulumi",
     // iac / env
-    "terraform", "tofu", "ansible", "ansible-playbook", "ansible-vault", "vagrant", "packer",
-    "nix", "nix-shell", "devenv", "direnv", "asdf", "mise",
+    "terraform",
+    "tofu",
+    "ansible",
+    "ansible-playbook",
+    "ansible-vault",
+    "vagrant",
+    "packer",
+    "nix",
+    "nix-shell",
+    "devenv",
+    "direnv",
+    "asdf",
+    "mise",
     // languages / build
-    "npm", "npx", "yarn", "pnpm", "bun", "bunx", "deno", "node", "python", "python3", "pip", "pip3",
-    "uv", "poetry", "conda", "pipenv", "go", "gofmt", "cargo", "rustc", "rustup", "cmake", "ninja",
-    "meson", "gradle", "mvn", "java", "javac", "kotlin", "dotnet", "php", "composer", "ruby", "gem",
-    "bundler", "rake", "rails", "perl", "lua", "zig", "tsc", "vite", "webpack", "jest", "vitest",
-    "eslint", "prettier", "pytest", "tox", "black", "ruff", "tsx", "nodemon", "pm2",
+    "npm",
+    "npx",
+    "yarn",
+    "pnpm",
+    "bun",
+    "bunx",
+    "deno",
+    "node",
+    "python",
+    "python3",
+    "pip",
+    "pip3",
+    "uv",
+    "poetry",
+    "conda",
+    "pipenv",
+    "go",
+    "gofmt",
+    "cargo",
+    "rustc",
+    "rustup",
+    "cmake",
+    "ninja",
+    "meson",
+    "gradle",
+    "mvn",
+    "java",
+    "javac",
+    "kotlin",
+    "dotnet",
+    "php",
+    "composer",
+    "ruby",
+    "gem",
+    "bundler",
+    "rake",
+    "rails",
+    "perl",
+    "lua",
+    "zig",
+    "tsc",
+    "vite",
+    "webpack",
+    "jest",
+    "vitest",
+    "eslint",
+    "prettier",
+    "pytest",
+    "tox",
+    "black",
+    "ruff",
+    "tsx",
+    "nodemon",
+    "pm2",
     // ai agents
-    "claude", "codex", "opencode", "aider", "gemini", "ollama",
+    "claude",
+    "codex",
+    "opencode",
+    "aider",
+    "gemini",
+    "ollama",
     // vcs
-    "git", "gh", "git-lfs", "svn", "hg",
+    "git",
+    "gh",
+    "git-lfs",
+    "svn",
+    "hg",
     // network / remote
-    "ssh", "scp", "sftp", "rsync", "curl", "wget", "ping", "dig", "nslookup", "host", "traceroute",
-    "tracepath", "mtr", "nc", "ncat", "socat", "netstat", "ss", "ip", "ifconfig", "openssl", "whois",
-    "ssh-keygen", "ssh-copy-id",
+    "ssh",
+    "scp",
+    "sftp",
+    "rsync",
+    "curl",
+    "wget",
+    "ping",
+    "dig",
+    "nslookup",
+    "host",
+    "traceroute",
+    "tracepath",
+    "mtr",
+    "nc",
+    "ncat",
+    "socat",
+    "netstat",
+    "ss",
+    "ip",
+    "ifconfig",
+    "openssl",
+    "whois",
+    "ssh-keygen",
+    "ssh-copy-id",
     // db
-    "psql", "mysql", "sqlite3", "mongo", "mongosh", "redis-cli", "prisma",
+    "psql",
+    "mysql",
+    "sqlite3",
+    "mongo",
+    "mongosh",
+    "redis-cli",
+    "prisma",
     // files / text
-    "awk", "sed", "grep", "egrep", "fgrep", "rg", "fd", "xargs", "jq", "yq", "column", "paste",
-    "comm", "cmp", "basename", "dirname", "realpath", "readlink", "sha256sum", "md5sum", "shasum",
-    "mktemp", "tar", "gzip", "gunzip", "zcat", "zip", "unzip", "7z", "xz", "bzip2",
+    "awk",
+    "sed",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "fd",
+    "xargs",
+    "jq",
+    "yq",
+    "column",
+    "paste",
+    "comm",
+    "cmp",
+    "basename",
+    "dirname",
+    "realpath",
+    "readlink",
+    "sha256sum",
+    "md5sum",
+    "shasum",
+    "mktemp",
+    "tar",
+    "gzip",
+    "gunzip",
+    "zcat",
+    "zip",
+    "unzip",
+    "7z",
+    "xz",
+    "bzip2",
     // sys / process / package managers
-    "pkill", "pgrep", "killall", "lsof", "groups", "printenv", "systemctl", "journalctl", "service",
-    "crontab", "shutdown", "reboot", "lsblk", "lspci", "lsusb", "sysctl", "dmesg", "apt", "apt-get",
-    "dpkg", "dnf", "yum", "rpm", "pacman", "apk", "zypper", "brew", "choco", "scoop", "winget",
-    "snap", "flatpak", "wsl", "ufw", "iptables", "chgrp", "umask",
+    "pkill",
+    "pgrep",
+    "killall",
+    "lsof",
+    "groups",
+    "printenv",
+    "systemctl",
+    "journalctl",
+    "service",
+    "crontab",
+    "shutdown",
+    "reboot",
+    "lsblk",
+    "lspci",
+    "lsusb",
+    "sysctl",
+    "dmesg",
+    "apt",
+    "apt-get",
+    "dpkg",
+    "dnf",
+    "yum",
+    "rpm",
+    "pacman",
+    "apk",
+    "zypper",
+    "brew",
+    "choco",
+    "scoop",
+    "winget",
+    "snap",
+    "flatpak",
+    "wsl",
+    "ufw",
+    "iptables",
+    "chgrp",
+    "umask",
     // editors
-    "vim", "nvim", "vi", "nano", "emacs", "code",
+    "vim",
+    "nvim",
+    "vi",
+    "nano",
+    "emacs",
+    "code",
     // media
-    "ffmpeg", "ffprobe", "magick", "convert", "yt-dlp",
+    "ffmpeg",
+    "ffprobe",
+    "magick",
+    "convert",
+    "yt-dlp",
     // shells / builtins
-    "bash", "zsh", "fish", "dash", "ksh", "tcsh", "pwsh", "eval", "printf", "pushd", "popd",
-    "sudo", "su",
+    "bash",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "tcsh",
+    "pwsh",
+    "eval",
+    "printf",
+    "pushd",
+    "popd",
+    "sudo",
+    "su",
     // common ambiguous ones kept out of AMBIGUOUS_COMMANDS because they are
     // almost never prose lead words
-    "htop", "btop",
+    "htop",
+    "btop",
 ]);
 
 // Known binaries that double as common English words ("make sure...",
@@ -76,18 +291,89 @@ const KNOWN_COMMANDS = new Set([
 // bare known-binary hit: a code fence, a flag/path/quoted argument, or a
 // single-token invocation.
 const AMBIGUOUS_COMMANDS = new Set([
-    "alias", "cat", "cd", "chown", "chmod", "clear", "cp", "cut", "date", "diff", "du", "df",
-    "echo", "env", "exec", "exit", "export", "find", "free", "grep", "head", "help", "history",
-    "id", "install", "kill", "less", "ln", "local", "ls", "make", "man", "mkdir", "more", "mount",
-    "umount", "mv", "printf", "ps", "pwd", "read", "rm", "rmdir", "sleep", "sort", "source",
-    "stat", "tail", "test", "time", "top", "touch", "tr", "true", "type", "uname", "uniq",
-    "unset", "uptime", "wait", "watch", "wc", "which", "whoami", "yes",
+    "alias",
+    "cat",
+    "cd",
+    "chown",
+    "chmod",
+    "clear",
+    "cp",
+    "cut",
+    "date",
+    "diff",
+    "du",
+    "df",
+    "echo",
+    "env",
+    "exec",
+    "exit",
+    "export",
+    "find",
+    "free",
+    "grep",
+    "head",
+    "help",
+    "history",
+    "id",
+    "install",
+    "kill",
+    "less",
+    "ln",
+    "local",
+    "ls",
+    "make",
+    "man",
+    "mkdir",
+    "more",
+    "mount",
+    "umount",
+    "mv",
+    "printf",
+    "ps",
+    "pwd",
+    "read",
+    "rm",
+    "rmdir",
+    "sleep",
+    "sort",
+    "source",
+    "stat",
+    "tail",
+    "test",
+    "time",
+    "top",
+    "touch",
+    "tr",
+    "true",
+    "type",
+    "uname",
+    "uniq",
+    "unset",
+    "uptime",
+    "wait",
+    "watch",
+    "wc",
+    "which",
+    "whoami",
+    "yes",
 ]);
 
 // Prefixes skipped when determining the first real token of a line.
 const WRAPPERS = new Set([
-    "sudo", "doas", "pkexec", "rlwrap", "env", "nice", "nohup", "stdbuf", "timeout", "watch",
-    "command", "builtin", "exec", "time",
+    "sudo",
+    "doas",
+    "pkexec",
+    "rlwrap",
+    "env",
+    "nice",
+    "nohup",
+    "stdbuf",
+    "timeout",
+    "watch",
+    "command",
+    "builtin",
+    "exec",
+    "time",
 ]);
 
 // Package managers print log lines that start with their own name
@@ -95,7 +381,17 @@ const WRAPPERS = new Set([
 // known-binary commands. "info" stays out: `npm info react` is a real command.
 const LOGGING_TOOLS = new Set(["npm", "yarn", "pnpm", "pip", "pip3", "brew", "gem", "composer"]);
 const LOG_LEVEL_WORDS = new Set([
-    "warn", "warning", "error", "err!", "notice", "verb", "verbose", "sill", "silly", "timing", "fatal",
+    "warn",
+    "warning",
+    "error",
+    "err!",
+    "notice",
+    "verb",
+    "verbose",
+    "sill",
+    "silly",
+    "timing",
+    "fatal",
     "deprecated",
 ]);
 
@@ -104,24 +400,155 @@ const BLOCK_OPEN_WORDS = new Set(["do", "if", "case", "{"]);
 const BLOCK_CLOSE_WORDS = new Set(["done", "fi", "esac", "}"]);
 
 const SHELL_FENCE_LANGS = new Set([
-    "sh", "bash", "zsh", "shell", "shellsession", "shell-session", "console", "terminal", "fish",
-    "ksh", "dash", "console-session",
+    "sh",
+    "bash",
+    "zsh",
+    "shell",
+    "shellsession",
+    "shell-session",
+    "console",
+    "terminal",
+    "fish",
+    "ksh",
+    "dash",
+    "console-session",
 ]);
 
 // Sentence lead words, used to reject prose that leaked into a code fence.
 const PROSE_WORDS = new Set([
-    "a", "an", "the", "this", "that", "these", "those", "it", "its", "you", "your", "we", "our",
-    "they", "their", "to", "of", "in", "on", "for", "with", "from", "into", "about", "as", "at",
-    "by", "is", "are", "was", "were", "be", "been", "and", "or", "but", "if", "then", "else",
-    "when", "while", "until", "because", "so", "such", "not", "no", "also", "only", "just", "can",
-    "could", "should", "would", "will", "shall", "may", "might", "must", "do", "does", "did",
-    "there", "here", "what", "which", "who", "how", "why", "where", "all", "any", "some", "own",
-    "same", "than", "too", "once", "note", "tip", "warning", "error", "info", "usage", "options",
-    "example", "examples", "available", "required", "optional", "see", "use", "using", "used",
-    "run", "runs", "running", "try", "first", "next", "after", "before", "above", "below",
-    "please", "instead", "add", "adds", "create", "creates", "makes", "gets", "sets", "opens",
-    "click", "select", "choose", "enter", "type", "copy", "paste", "download", "upload", "check",
-    "verify", "ensure", "enable", "disable", "start", "stop", "restart", "build", "deploy",
+    "a",
+    "an",
+    "the",
+    "this",
+    "that",
+    "these",
+    "those",
+    "it",
+    "its",
+    "you",
+    "your",
+    "we",
+    "our",
+    "they",
+    "their",
+    "to",
+    "of",
+    "in",
+    "on",
+    "for",
+    "with",
+    "from",
+    "into",
+    "about",
+    "as",
+    "at",
+    "by",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "and",
+    "or",
+    "but",
+    "if",
+    "then",
+    "else",
+    "when",
+    "while",
+    "until",
+    "because",
+    "so",
+    "such",
+    "not",
+    "no",
+    "also",
+    "only",
+    "just",
+    "can",
+    "could",
+    "should",
+    "would",
+    "will",
+    "shall",
+    "may",
+    "might",
+    "must",
+    "do",
+    "does",
+    "did",
+    "there",
+    "here",
+    "what",
+    "which",
+    "who",
+    "how",
+    "why",
+    "where",
+    "all",
+    "any",
+    "some",
+    "own",
+    "same",
+    "than",
+    "too",
+    "once",
+    "note",
+    "tip",
+    "warning",
+    "error",
+    "info",
+    "usage",
+    "options",
+    "example",
+    "examples",
+    "available",
+    "required",
+    "optional",
+    "see",
+    "use",
+    "using",
+    "used",
+    "run",
+    "runs",
+    "running",
+    "try",
+    "first",
+    "next",
+    "after",
+    "before",
+    "above",
+    "below",
+    "please",
+    "instead",
+    "add",
+    "adds",
+    "create",
+    "creates",
+    "makes",
+    "gets",
+    "sets",
+    "opens",
+    "click",
+    "select",
+    "choose",
+    "enter",
+    "type",
+    "copy",
+    "paste",
+    "download",
+    "upload",
+    "check",
+    "verify",
+    "ensure",
+    "enable",
+    "disable",
+    "start",
+    "stop",
+    "restart",
+    "build",
+    "deploy",
     "configure",
 ]);
 
@@ -153,17 +580,40 @@ const VersionOutputRegex = /^\S+\s+version\s+\S*\d+\.\d+/i;
 const CompoundStartRegex = /^(?:if|for|while|until|case|select)\s.+(?:;\s*(?:then|do)|\sin)$/;
 const QuotedStringRegex = /"(?:[^"\\]|\\.)*"|'[^']*'/g;
 const BulletRegex = /^(?:[-*•‣▪◦]|\d+[.)])\s+/;
+// Line-number gutters from `cat -n`, `bat`, `nl`: `  12 │ cmd`, `  3<tab>cmd`.
+const GutterRegex = /^\d{1,5}(?:\t|\s*[│┃]\s?)/;
+// PowerShell / cmd.exe prompts: `PS C:\Users\me> cmd`, `C:\> cmd`.
+const WinPromptRegex = /^(?:PS\s+)?[A-Za-z]:\\[^\s>]*>\s?/;
+// Secondary prompt the shell prints in front of continuation lines.
+const Ps2Regex = /^(\s*)(?:>|…)\s/;
+// Typographic characters that a renderer may have substituted; the shell
+// needs their ASCII form.
+// the zero-width joiner is listed as an alternation: eslint flags joiners
+// inside a character class
+const InvisibleCharsRegex = /[\u200b\u200c\ufeff]|\u200d/g;
+const OddSpaceRegex = /[\u00a0\u2007\u202f]/g;
+const SmartSingleQuoteRegex = /[\u2018\u2019]/g;
+const SmartDoubleQuoteRegex = /[\u201c\u201d]/g;
 const FenceRegex = /^(`{3,}|~{3,})(.*)$/;
 const BacktickSpanRegex = /`([^`]+)`/g;
 // `;` is excluded: a line-ending semicolon terminates rather than continues,
 // and is far more common in prose ("...as follows;").
 const ContinuationRegex = /(?:\\|&&|\|\||\|)\s*$/;
+// A line starting with a flag is never a command of its own: it is the tail
+// of the previous command, wrapped by the TUI that printed it.
+const SoftWrapFlagRegex = /^-{1,2}[A-Za-z]/;
 const SentenceEndRegex = /[?.!]$/;
 const UrlRegex = /^https?:\/\//i;
 // Fallback (unknown binary) candidates must start lowercase or path-like.
 const FallbackTokenRegex = /^[a-z_.~/][-a-z0-9_.:@~/]*$/;
 const ShellMetaRegex = /&&|\|\||[|;]|\$\(|>>|>/;
 const EnvAssignRegex = /^\w+=(?:"[^"]*"|'[^']*'|\S+)$/;
+// Option values that follow a wrapper's flag: `watch -n 2`, `timeout 5s`.
+const WrapperOptValueRegex = /^\d+(?:\.\d+)?[smhd]?$/;
+// Wrapper flags whose next token is a value, not the wrapped command:
+// sudo -u/-g, watch/nice -n, timeout -s/-k, env -C/-S, stdbuf -o/-e.
+const WrapperValueFlags = new Set(["-u", "-g", "-n", "-s", "-k", "-C", "-S", "-o", "-e"]);
+const LeadingQuoteRegex = /^["'`]+/;
 
 function stripAnsi(line: string): string {
     if (!line.includes("\x1b")) {
@@ -172,12 +622,33 @@ function stripAnsi(line: string): string {
     return line.replace(AnsiRegex, "");
 }
 
+// Removes escape codes and normalizes characters that would break a pasted
+// command: non-breaking spaces, zero-width marks and curly quotes.
+function sanitizeLine(rawLine: string): string {
+    return stripAnsi(rawLine)
+        .replace(InvisibleCharsRegex, "")
+        .replace(OddSpaceRegex, " ")
+        .replace(SmartSingleQuoteRegex, "'")
+        .replace(SmartDoubleQuoteRegex, '"');
+}
+
+// Per-line trailing whitespace would turn `cmd \` into a broken escape, and
+// trailing blank lines are noise in the clipboard.
+function finalizeCommand(command: string): string {
+    const lines = command.split("\n").map((l) => l.trimEnd());
+    while (lines.length > 1 && lines[lines.length - 1] == "") {
+        lines.pop();
+    }
+    return lines.join("\n");
+}
+
 export function cleanCommandLine(rawLine: string): string {
-    let line = stripAnsi(rawLine).trim();
+    let line = sanitizeLine(rawLine).trim();
     if (line == "") {
         return "";
     }
     line = line.replace(LeadingDecorRegex, "").replace(TrailingDecorRegex, "").trim();
+    line = line.replace(GutterRegex, "").replace(WinPromptRegex, "").trim();
     if (line == "" || line.startsWith("#")) {
         return "";
     }
@@ -197,10 +668,11 @@ export function cleanCommandLine(rawLine: string): string {
 // of every response line) is removed so nested lines keep only their
 // relative indentation.
 function cleanContinuationLine(rawLine: string, baseIndent: number): string {
-    let line = stripAnsi(rawLine).replace(TrailingDecorRegex, "").trimEnd();
+    let line = sanitizeLine(rawLine).replace(TrailingDecorRegex, "").trimEnd();
     if (!/^\s/.test(line)) {
         line = line.replace(LeadingDecorRegex, "");
     }
+    line = line.replace(Ps2Regex, "$1");
     const indent = line.length - line.trimStart().length;
     return line.slice(Math.min(indent, baseIndent)).trimEnd();
 }
@@ -238,9 +710,7 @@ function parseFenceMarker(cleanedLine: string, inFence: boolean): FenceMarker | 
 
 function extractCandidates(cleanedLine: string): string[] {
     if (cleanedLine.includes("`")) {
-        const spans = [...cleanedLine.matchAll(BacktickSpanRegex)]
-            .map((m) => m[1].trim())
-            .filter((s) => s != "");
+        const spans = [...cleanedLine.matchAll(BacktickSpanRegex)].map((m) => m[1].trim()).filter((s) => s != "");
         if (spans.length > 0) {
             return spans;
         }
@@ -257,9 +727,7 @@ function endsWithSentencePunctuation(command: string): boolean {
 }
 
 function hasTechnicalArg(tokens: string[]): boolean {
-    return tokens
-        .slice(1)
-        .some((t) => (t.startsWith("-") && t.length > 1) || /[/\\.@:=~$#%"'`]/.test(t));
+    return tokens.slice(1).some((t) => (t.startsWith("-") && t.length > 1) || /[/\\.@:=~$#%"'`]/.test(t));
 }
 
 // Strips env assignments and wrapper commands to find the first real token.
@@ -276,8 +744,18 @@ function getEffectiveTokens(command: string): string[] {
         }
         if (WRAPPERS.has(first) && tokens.length > 1) {
             tokens = tokens.slice(1);
-            if (first == "timeout" && /^\d+(\.\d+)?[smhd]?$/.test(tokens[0])) {
+            // skip the wrapper's own options: `watch -n 2`, `sudo -u postgres`, `timeout 5s`
+            while (tokens.length > 1 && (tokens[0].startsWith("-") || WrapperOptValueRegex.test(tokens[0]))) {
+                const takesValue = WrapperValueFlags.has(tokens[0]);
                 tokens = tokens.slice(1);
+                if (takesValue && tokens.length > 1 && !tokens[0].startsWith("-")) {
+                    tokens = tokens.slice(1);
+                }
+            }
+            // `watch -n 2 '` opens a multi-line quoted script: the wrapper is
+            // the command, the script follows on the next lines
+            if (/^["']$/.test(tokens[0] ?? "")) {
+                return [first];
             }
             continue;
         }
@@ -298,8 +776,9 @@ function acceptsAsCommand(candidate: string, inFence: boolean, fenceLang: string
         return false;
     }
     const effective = getEffectiveTokens(candidate);
-    const firstToken = effective[0];
-    if (firstToken == null) {
+    // `watch -n 2 'kubectl get pods'`: the real command sits inside the quote
+    const firstToken = effective[0]?.replace(LeadingQuoteRegex, "");
+    if (firstToken == null || firstToken == "") {
         return false;
     }
     const basename = firstToken.split("/").pop();
@@ -391,9 +870,93 @@ function readContinuation(
     return { command: joined, lastLine };
 }
 
+// True when a single or double quote opened in `text` is still open at its end.
+function hasUnclosedQuote(text: string): boolean {
+    let quote: string = null;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch == "\\" && quote != "'") {
+            i++;
+            continue;
+        }
+        if (quote == null && (ch == "'" || ch == '"')) {
+            quote = ch;
+        } else if (ch == quote) {
+            quote = null;
+        }
+    }
+    return quote != null;
+}
+
+function displayedWidth(rawLine: string): number {
+    return stripAnsi(rawLine).replace(TrailingDecorRegex, "").trimEnd().length;
+}
+
+// TUIs (Claude Code, opencode, ...) word-wrap long commands onto new lines in
+// narrow blocks. Those lines are not xterm-wrapped, so they reach us as
+// separate logical lines; rejoin them with a space.
+function readSoftWrap(
+    lines: string[],
+    lastLine: number,
+    command: string,
+    inFence: boolean,
+    cols: number | undefined
+): { command: string; lastLine: number } {
+    const firstIndent = leadingIndent(lines[lastLine]);
+    const startLine = lastLine;
+    for (let j = lastLine + 1; j < lines.length; ) {
+        const inQuote = hasUnclosedQuote(command);
+        if (j - startLine > (inQuote ? MaxQuotedLines : MaxContinuationLines)) {
+            break;
+        }
+        if (parseFenceMarker(stripAnsi(lines[j]).trim(), inFence) != null) {
+            break;
+        }
+        if (inQuote) {
+            // inside the quote everything is script text: keep blank lines and
+            // relative indentation, except for TUI-wrapped tails (column 0)
+            const wrappedTail = firstIndent > 0 && leadingIndent(lines[j]) < firstIndent;
+            const text = wrappedTail
+                ? cleanContinuationLine(lines[j], 0).trim()
+                : cleanContinuationLine(lines[j], firstIndent);
+            command += (wrappedTail && text != "" ? " " : "\n") + text;
+            lastLine = j;
+            j++;
+            continue;
+        }
+        const next = cleanCommandLine(lines[j]);
+        if (next == "") {
+            break;
+        }
+        const firstToken = next.split(/\s+/)[0];
+        const widthOverflow = cols != null && displayedWidth(lines[j - 1]) + 1 + firstToken.length > cols;
+        // a TUI wraps onto column 0 while the command itself was indented
+        const indentDrop = firstIndent > 0 && leadingIndent(lines[j]) < firstIndent;
+        const isFlag = SoftWrapFlagRegex.test(next);
+        if (!isFlag && !widthOverflow && !indentDrop) {
+            break;
+        }
+        if (!isFlag) {
+            const basename = firstToken.split("/").pop() ?? "";
+            if (
+                KNOWN_COMMANDS.has(basename) ||
+                AMBIGUOUS_COMMANDS.has(basename) ||
+                PROSE_WORDS.has(firstToken) ||
+                endsWithSentencePunctuation(next)
+            ) {
+                break;
+            }
+        }
+        command += " " + next;
+        lastLine = j;
+        j++;
+    }
+    return { command, lastLine };
+}
+
 // Every command occurrence in order, without dedup. Used directly by the hover
 // overlay, which needs the exact line range of each occurrence.
-export function scanCommands(lines: string[]): CommandOccurrence[] {
+export function scanCommands(lines: string[], opts?: ScanOptions): CommandOccurrence[] {
     const results: CommandOccurrence[] = [];
     let inFence = false;
     let fenceMarker = "";
@@ -423,7 +986,12 @@ export function scanCommands(lines: string[]): CommandOccurrence[] {
                 const cont = readContinuation(lines, i, candidate, inFence);
                 if (cont.lastLine > i) {
                     lastLine = cont.lastLine;
-                    results.push({ command: cont.command, lineIndex: i, endLineIndex: lastLine, inFence });
+                    results.push({
+                        command: finalizeCommand(cont.command),
+                        lineIndex: i,
+                        endLineIndex: lastLine,
+                        inFence,
+                    });
                 }
                 continue;
             }
@@ -431,22 +999,25 @@ export function scanCommands(lines: string[]): CommandOccurrence[] {
                 continue;
             }
             if (fromSpans) {
-                results.push({ command: candidate, lineIndex: i, endLineIndex: i, inFence });
+                results.push({ command: finalizeCommand(candidate), lineIndex: i, endLineIndex: i, inFence });
                 continue;
             }
-            const cont = readContinuation(lines, i, candidate, inFence);
+            let cont = readContinuation(lines, i, candidate, inFence);
+            if (cont.lastLine == i) {
+                cont = readSoftWrap(lines, i, cont.command, inFence, opts?.cols);
+            }
             lastLine = cont.lastLine;
-            results.push({ command: cont.command, lineIndex: i, endLineIndex: lastLine, inFence });
+            results.push({ command: finalizeCommand(cont.command), lineIndex: i, endLineIndex: lastLine, inFence });
         }
         i = lastLine;
     }
     return results;
 }
 
-export function extractCommands(lines: string[]): DetectedCommand[] {
+export function extractCommands(lines: string[], opts?: ScanOptions): DetectedCommand[] {
     const results: DetectedCommand[] = [];
     const byCommand = new Map<string, DetectedCommand>();
-    for (const occ of scanCommands(lines)) {
+    for (const occ of scanCommands(lines, opts)) {
         const existing = byCommand.get(occ.command);
         if (existing != null) {
             existing.count++;
