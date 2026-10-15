@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { scanCommands } from "./cmd-extract";
-import { findHoveredOccurrence, readViewportText } from "./cmd-hover-layout";
+import { findHoveredOccurrence, readBufferText, readViewportText } from "./cmd-hover-layout";
 
 type FakeRow = { text: string; wrapped?: boolean };
 
@@ -60,5 +60,86 @@ describe("term-cmdhover viewport mapping", () => {
         const occurrences = scanCommands(text.lines);
         expect(findHoveredOccurrence(text, occurrences, 0, 8, 80)?.command).toBe("kubectl get pods");
         expect(findHoveredOccurrence(text, occurrences, 0, 32, 80)?.command).toBe("helm list");
+    });
+});
+
+type FakeCell = { ch: string; color: number };
+
+function coloredBuffer(rows: FakeCell[][]): any {
+    let current: FakeCell = null;
+    const cell = {
+        getWidth: () => 1,
+        getChars: () => current.ch,
+        getFgColorMode: () => (current.color == 0 ? 0 : 1),
+        getFgColor: () => current.color,
+    };
+    return {
+        length: rows.length,
+        getNullCell: () => cell,
+        getLine: (i: number) =>
+            rows[i] == null
+                ? undefined
+                : {
+                      isWrapped: false,
+                      length: rows[i].length,
+                      translateToString: () =>
+                          rows[i]
+                              .map((c) => c.ch)
+                              .join("")
+                              .trimEnd(),
+                      getCell: (x: number) => {
+                          current = rows[i][x];
+                          return current == null ? undefined : cell;
+                      },
+                  },
+    };
+}
+
+// builds a row from segments, each drawn in its own color (0 = default)
+function row(...segments: Array<[string, number]>): FakeCell[] {
+    return segments.flatMap(([text, color]) => [...text].map((ch) => ({ ch, color })));
+}
+
+describe("inline code rendered as colored text", () => {
+    it("finds commands a TUI colored instead of wrapping in backticks", () => {
+        const buffer = coloredBuffer([
+            row(
+                ["Lance ", 0],
+                ["kubectl get pods -n prod", 6],
+                [" puis ", 0],
+                ["helm list -A", 6],
+                [" pour vérifier.", 0]
+            ),
+        ]);
+        const text = readBufferText(buffer, 0, 1);
+        expect(text.styledRuns[0].map(([a, b]) => text.lines[0].slice(a, b))).toEqual([
+            "kubectl get pods -n prod",
+            "helm list -A",
+        ]);
+        const occurrences = scanCommands(text.lines, { styledRuns: text.styledRuns });
+        expect(occurrences.map((o) => o.command)).toEqual(["kubectl get pods -n prod", "helm list -A"]);
+        expect(findHoveredOccurrence(text, occurrences, 0, 38, 80)?.command).toBe("helm list -A");
+    });
+
+    it("ignores colored words and paths that are not commands", () => {
+        const buffer = coloredBuffer([
+            row(["Cela nécessite que ", 0], ["Metrics Server", 3], [" soit installé.", 0]),
+            row(["J'ai modifié ", 0], ["~/projet/app.ts", 3], [" et ", 0], ["./install.sh", 3], [".", 0]),
+            row(["Ouvre ", 0], ["htop", 3], [" pour voir.", 0]),
+        ]);
+        const text = readBufferText(buffer, 0, 3);
+        expect(scanCommands(text.lines, { styledRuns: text.styledRuns }).map((o) => o.command)).toEqual(["htop"]);
+    });
+
+    it("does not split syntax-highlighted lines inside a fence", () => {
+        const buffer = coloredBuffer([
+            row(["```bash", 0]),
+            row(["cat ", 0], ["<<EOF", 4], [" > config.yaml", 6]),
+            row(["EOF", 4]),
+            row(["```", 0]),
+        ]);
+        const text = readBufferText(buffer, 0, 4);
+        const occurrences = scanCommands(text.lines, { styledRuns: text.styledRuns });
+        expect(occurrences.map((o) => o.command)).toEqual(["cat <<EOF > config.yaml\nEOF"]);
     });
 });

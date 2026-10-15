@@ -15,6 +15,8 @@ export type ViewportText = {
     // first buffer row and row count of each logical (unwrapped) line
     startRows: number[];
     rowCounts: number[];
+    // per logical line, [start, end) offsets of differently colored text
+    styledRuns: Array<Array<[number, number]>>;
 };
 
 export type HoverBox = {
@@ -25,13 +27,69 @@ export type HoverBox = {
     height: number;
     rowHeight: number;
     screenRight: number;
+    // more text follows the command on its row (an inline command in prose)
+    textAfter: boolean;
+    // set for a whole code block, e.g. "python"
+    blockLang?: string;
 };
 
-export function readViewportText(buffer: TermTypes.IBuffer, viewportY: number, rows: number): ViewportText {
-    const start = Math.max(0, viewportY - ContextRows);
-    const end = Math.min(buffer.length, viewportY + rows + ContextRows);
-    const text: ViewportText = { lines: [], startRows: [], rowCounts: [] };
-    for (let row = start; row < end; row++) {
+// Runs of non-space text whose foreground differs from the row's dominant
+// color, as string offsets matching translateToString. Wide glyphs occupy two
+// cells but one string position, hence the width-0 skip.
+function rowStyledRuns(line: TermTypes.IBufferLine, cell: TermTypes.IBufferCell): Array<[number, number]> {
+    const glyphs: Array<{ start: number; end: number; key: string }> = [];
+    const counts = new Map<string, number>();
+    let offset = 0;
+    for (let x = 0; x < line.length; x++) {
+        if (line.getCell(x, cell) == null || cell.getWidth() == 0) {
+            continue;
+        }
+        const chars = cell.getChars() || " ";
+        if (chars.trim() != "") {
+            const key = `${cell.getFgColorMode()}:${cell.getFgColor()}`;
+            glyphs.push({ start: offset, end: offset + chars.length, key });
+            counts.set(key, (counts.get(key) ?? 0) + 1);
+        }
+        offset += chars.length;
+    }
+    if (counts.size < 2) {
+        return [];
+    }
+    // prose is normally drawn in the default color (mode 0), even when the
+    // highlighted code outnumbers it; only fall back to the most frequent
+    // color when the TUI paints every glyph explicitly
+    let baseKey = [...counts.keys()].find((k) => k.startsWith("0:")) ?? "";
+    if (baseKey == "") {
+        let baseCount = -1;
+        for (const [key, count] of counts) {
+            if (count > baseCount) {
+                baseKey = key;
+                baseCount = count;
+            }
+        }
+    }
+    const runs: Array<[number, number]> = [];
+    let runKey: string = null;
+    for (const g of glyphs) {
+        if (g.key == baseKey) {
+            runKey = null;
+            continue;
+        }
+        if (runKey == g.key) {
+            runs[runs.length - 1][1] = g.end;
+            continue;
+        }
+        runKey = g.key;
+        runs.push([g.start, g.end]);
+    }
+    return runs;
+}
+
+export function readBufferText(buffer: TermTypes.IBuffer, start: number, end: number): ViewportText {
+    const text: ViewportText = { lines: [], startRows: [], rowCounts: [], styledRuns: [] };
+    // test doubles may not implement cells; color runs are then skipped
+    const cell = typeof buffer.getNullCell == "function" ? buffer.getNullCell() : null;
+    for (let row = Math.max(0, start); row < Math.min(buffer.length, end); row++) {
         const line = buffer.getLine(row);
         if (line == null) {
             continue;
@@ -40,8 +98,11 @@ export function readViewportText(buffer: TermTypes.IBuffer, viewportY: number, r
         // otherwise column offsets into the joined logical line drift
         const wrapsOn = buffer.getLine(row + 1)?.isWrapped ?? false;
         const lineText = line.translateToString(!wrapsOn);
+        const runs = cell != null ? rowStyledRuns(line, cell) : [];
         const last = text.lines.length - 1;
         if (line.isWrapped && last >= 0) {
+            const shift = text.lines[last].length;
+            text.styledRuns[last].push(...runs.map(([a, b]): [number, number] => [a + shift, b + shift]));
             text.lines[last] += lineText;
             text.rowCounts[last]++;
             continue;
@@ -49,8 +110,13 @@ export function readViewportText(buffer: TermTypes.IBuffer, viewportY: number, r
         text.lines.push(lineText);
         text.startRows.push(row);
         text.rowCounts.push(1);
+        text.styledRuns.push(runs);
     }
     return text;
+}
+
+export function readViewportText(buffer: TermTypes.IBuffer, viewportY: number, rows: number): ViewportText {
+    return readBufferText(buffer, viewportY - ContextRows, viewportY + rows + ContextRows);
 }
 
 function occurrenceRows(text: ViewportText, occ: CommandOccurrence): [number, number] {
@@ -135,6 +201,7 @@ export function computeBox(
     if (endCol <= startCol) {
         return null;
     }
+    const rowRest = idx >= 0 ? text.lines[occ.lineIndex].slice(endCol) : "";
     const left = Math.max(screenRect.left, screenRect.left + startCol * cellW - BoxPadPx);
     const right = Math.min(screenRect.right, screenRect.left + endCol * cellW + BoxPadPx);
     return {
@@ -145,6 +212,8 @@ export function computeBox(
         height: (visLast - visFirst + 1) * cellH,
         rowHeight: cellH,
         screenRight: screenRect.right,
+        textAfter: rowRest.trim() != "",
+        blockLang: occ.block?.lang,
     };
 }
 

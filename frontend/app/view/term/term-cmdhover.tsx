@@ -19,17 +19,25 @@ import * as React from "react";
 
 const HideDelayMs = 500;
 const FadeOutMs = 150;
+// While the wheel spins the box is hidden; it comes back once scrolling has
+// been quiet for this long.
+const ScrollSettleMs = 150;
+// While a program streams output, rescan the screen at most this often:
+// a scan reads every cell (for colors), too costly to repeat every frame.
+const WriteRescanMs = 100;
 const CopiedFeedbackMs = 1500;
 // Slack around the box within which the pointer keeps it alive, so the trip
 // from the command text to the copy button survives a slightly diagonal move.
 const StickyPadPx = 8;
 // The copy chip sits to the right of the box, or above it when the box ends
 // near the terminal's right edge; its zone must count as inside.
-const ChipZonePx = 90;
+const ChipZonePx = 130;
 const ChipAboveZonePx = 30;
 
+// Beside the box when the row is free; above it when text follows the
+// command (the chip would hide it) or the terminal edge is too close.
 function chipFitsRight(box: HoverBox): boolean {
-    return box.left + box.width + ChipZonePx <= box.screenRight;
+    return !box.textAfter && box.left + box.width + ChipZonePx <= box.screenRight;
 }
 
 function isInsideBox(box: HoverBox, x: number, y: number): boolean {
@@ -42,7 +50,8 @@ function isInsideBox(box: HoverBox, x: number, y: number): boolean {
     );
 }
 
-const CmdCopyChip = ({ command }: { command: string }) => {
+const CmdCopyChip = ({ command, lang }: { command: string; lang?: string }) => {
+    const what = lang == null ? "command" : lang == "" ? "code" : lang;
     const [copied, setCopied] = React.useState(false);
     const timerRef = React.useRef<number | null>(null);
 
@@ -71,11 +80,11 @@ const CmdCopyChip = ({ command }: { command: string }) => {
     return (
         <button
             type="button"
-            title="Copy command"
-            aria-label="Copy command"
+            title={`Copy ${what}`}
+            aria-label={`Copy ${what}`}
             onClick={handleClick}
             className={cn(
-                "flex h-full max-h-[22px] min-h-4 cursor-pointer items-center gap-1 rounded border px-1.5 text-[11px] leading-none select-none",
+                "flex h-full max-h-[22px] min-h-4 shrink-0 cursor-pointer items-center gap-1 rounded border px-1.5 text-[11px] leading-none whitespace-nowrap select-none",
                 "bg-modalbg shadow-md transition-colors",
                 copied
                     ? "border-accent/70 text-accent"
@@ -83,7 +92,7 @@ const CmdCopyChip = ({ command }: { command: string }) => {
             )}
         >
             <i className={makeIconClass(copied ? "check" : "copy", true)} />
-            <span>{copied ? "Copied" : "Copy"}</span>
+            <span>{copied ? "Copied" : lang == null ? "Copy" : `Copy ${what}`}</span>
         </button>
     );
 };
@@ -141,19 +150,59 @@ export const TermCmdHover = React.memo(function TermCmdHover({ termWrap }: TermC
         let lastMouse: { x: number; y: number } = null;
         let mouseDown = false;
         let rafId: number = null;
+        let scrollingUntil = 0;
+        let settleTimer: number = null;
+        let writeTimer: number = null;
 
         const getScan = () => {
             if (cache == null) {
                 const buffer = terminal.buffer.active;
                 const text = readViewportText(buffer, buffer.viewportY, terminal.rows);
-                cache = { text, occurrences: scanCommands(text.lines, { cols: terminal.cols }) };
+                cache = {
+                    text,
+                    occurrences: scanCommands(text.lines, { cols: terminal.cols, styledRuns: text.styledRuns }),
+                };
             }
             return cache;
         };
 
+        // The box is drawn at fixed screen coordinates, so whenever the text
+        // under it moves (scroll, TUI redraw, resize) it must be re-anchored to
+        // where its command is now, or dropped if the command is gone.
+        // Otherwise it floats over unrelated lines.
+        const relocateCurrent = (screenRect: DOMRect): HoverBox | null => {
+            const current = boxRef.current;
+            if (current == null) {
+                return null;
+            }
+            const { text, occurrences } = getScan();
+            let best: HoverBox = null;
+            for (const occ of occurrences) {
+                if (occ.command != current.command) {
+                    continue;
+                }
+                const candidate = computeBox(terminal, screenRect, text, occ);
+                if (
+                    candidate != null &&
+                    (best == null || Math.abs(candidate.top - current.top) < Math.abs(best.top - current.top))
+                ) {
+                    best = candidate;
+                }
+            }
+            if (best == null) {
+                cancelHide();
+                setBox(null);
+                return null;
+            }
+            if (best.top != current.top || best.left != current.left || best.height != current.height) {
+                setBox(best);
+            }
+            return best;
+        };
+
         const update = () => {
             rafId = null;
-            if (lastMouse == null || mouseDown) {
+            if (mouseDown || Date.now() < scrollingUntil) {
                 return;
             }
             const screenRect = getScreenRect(terminal);
@@ -161,7 +210,12 @@ export const TermCmdHover = React.memo(function TermCmdHover({ termWrap }: TermC
                 scheduleHide();
                 return;
             }
-            const current = boxRef.current;
+            // re-anchor even when the pointer rests on the copy chip, which
+            // sits outside the terminal element
+            const current = relocateCurrent(screenRect);
+            if (lastMouse == null) {
+                return;
+            }
             const stickToCurrent = current != null && isInsideBox(current, lastMouse.x, lastMouse.y);
             const col = Math.floor(((lastMouse.x - screenRect.left) / screenRect.width) * terminal.cols);
             const viewRow = Math.floor(((lastMouse.y - screenRect.top) / screenRect.height) * terminal.rows);
@@ -204,6 +258,31 @@ export const TermCmdHover = React.memo(function TermCmdHover({ termWrap }: TermC
             requestUpdate();
         };
 
+        // trailing throttle: the last write in a burst is always picked up
+        const invalidateAfterWrite = () => {
+            if (writeTimer != null) {
+                return;
+            }
+            writeTimer = window.setTimeout(() => {
+                writeTimer = null;
+                invalidate();
+            }, WriteRescanMs);
+        };
+
+        const handleWheel = () => {
+            cache = null;
+            cancelHide();
+            setBox(null);
+            scrollingUntil = Date.now() + ScrollSettleMs;
+            if (settleTimer != null) {
+                window.clearTimeout(settleTimer);
+            }
+            settleTimer = window.setTimeout(() => {
+                settleTimer = null;
+                requestUpdate();
+            }, ScrollSettleMs);
+        };
+
         const handleMouseMove = (e: MouseEvent) => {
             lastMouse = { x: e.clientX, y: e.clientY };
             requestUpdate();
@@ -225,10 +304,10 @@ export const TermCmdHover = React.memo(function TermCmdHover({ termWrap }: TermC
         elem.addEventListener("mousemove", handleMouseMove);
         elem.addEventListener("mouseleave", handleMouseLeave);
         elem.addEventListener("mousedown", handleMouseDown);
-        elem.addEventListener("wheel", invalidate, { passive: true });
+        elem.addEventListener("wheel", handleWheel, { passive: true });
         window.addEventListener("mouseup", handleMouseUp);
         const disposables = [
-            terminal.onWriteParsed(invalidate),
+            terminal.onWriteParsed(invalidateAfterWrite),
             terminal.onScroll(invalidate),
             terminal.onResize(invalidate),
             terminal.buffer.onBufferChange(invalidate),
@@ -237,7 +316,13 @@ export const TermCmdHover = React.memo(function TermCmdHover({ termWrap }: TermC
             elem.removeEventListener("mousemove", handleMouseMove);
             elem.removeEventListener("mouseleave", handleMouseLeave);
             elem.removeEventListener("mousedown", handleMouseDown);
-            elem.removeEventListener("wheel", invalidate);
+            elem.removeEventListener("wheel", handleWheel);
+            if (settleTimer != null) {
+                window.clearTimeout(settleTimer);
+            }
+            if (writeTimer != null) {
+                window.clearTimeout(writeTimer);
+            }
             window.removeEventListener("mouseup", handleMouseUp);
             disposables.forEach((d) => d.dispose());
             if (rafId != null) {
@@ -272,7 +357,7 @@ export const TermCmdHover = React.memo(function TermCmdHover({ termWrap }: TermC
                     onMouseMove={cancelHide}
                     onMouseLeave={scheduleHide}
                 >
-                    <CmdCopyChip key={box.command} command={box.command} />
+                    <CmdCopyChip key={box.command} command={box.command} lang={box.blockLang} />
                 </div>
             </div>
         </FloatingPortal>

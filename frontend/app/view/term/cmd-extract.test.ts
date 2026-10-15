@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 
-import { cleanCommandLine, commandsToCopyText, extractCommands, scanCommands } from "./cmd-extract";
+import { cleanCommandLine, commandsToCopyText, extractCommands, filterCommands, scanCommands } from "./cmd-extract";
 
 function commandsOf(lines: string[]): string[] {
     return extractCommands(lines).map((c) => c.command);
@@ -200,9 +200,20 @@ describe("extractCommands prose rejection", () => {
 });
 
 describe("extractCommands limits", () => {
-    it("caps the number of detected commands", () => {
+    it("caps the number of detected commands and keeps the most recent ones", () => {
         const lines = Array.from({ length: 60 }, (_, i) => `kubectl get pod-${i}`);
-        expect(extractCommands(lines).length).toBe(50);
+        const results = extractCommands(lines);
+        expect(results.length).toBe(50);
+        expect(results[0].command).toBe("kubectl get pod-10");
+        expect(results[49].command).toBe("kubectl get pod-59");
+    });
+
+    it("orders by latest occurrence, oldest first", () => {
+        const lines = ["$ git status", "$ kubectl get pods", "$ git status"];
+        const results = extractCommands(lines);
+        expect(results.map((c) => c.command)).toEqual(["kubectl get pods", "git status"]);
+        expect(results[1].lineIndex).toBe(2);
+        expect(results[1].count).toBe(2);
     });
 
     it("rejects overly long or token-heavy lines", () => {
@@ -344,6 +355,124 @@ describe("extractCommands TUI soft wrap", () => {
     });
 });
 
+describe("extractCommands heredocs and config text", () => {
+    it("keeps a heredoc and its body together up to the delimiter", () => {
+        const lines = [
+            "```bash",
+            "  cat <<EOF > config.yaml",
+            "  apiVersion: v1",
+            "  kind: ConfigMap",
+            "  metadata:",
+            "    name: application-config",
+            "",
+            "  data:",
+            "    LOG_LEVEL: info",
+            "  EOF",
+            "```",
+        ];
+        const results = scanCommands(lines);
+        expect(results.length).toBe(1);
+        expect(results[0].command).toBe(
+            "cat <<EOF > config.yaml\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: application-config\n\ndata:\n  LOG_LEVEL: info\nEOF"
+        );
+        expect(results[0].endLineIndex).toBe(9);
+    });
+
+    it("handles quoted and dash heredoc delimiters", () => {
+        expect(commandsOf(["cat > x.sh <<'END'", "echo $HOME", "END"])).toEqual([
+            "cat > x.sh <<'END'\necho $HOME\nEND",
+        ]);
+        expect(commandsOf(["kubectl apply -f - <<-EOF", "\tkind: Pod", "\tEOF"])).toEqual([
+            "kubectl apply -f - <<-EOF\n\tkind: Pod\nEOF",
+        ]);
+    });
+
+    it("does not treat a here-string or an unterminated heredoc as a block", () => {
+        expect(commandsOf(['grep foo <<< "$text"'])).toEqual(['grep foo <<< "$text"']);
+        expect(commandsOf(["kubectl apply -f - <<EOF", "some text", ""])).toEqual(["kubectl apply -f - <<EOF"]);
+    });
+
+    it("never takes YAML key: value lines for commands", () => {
+        const lines = ["```bash", "kind: ConfigMap", "name: application-config", "image: nginx:latest", "```"];
+        expect(commandsOf(lines)).toEqual([]);
+    });
+});
+
+describe("extractCommands fenced scripts", () => {
+    const script = [
+        "```bash",
+        "  #!/usr/bin/env bash",
+        "  set -euo pipefail",
+        "",
+        "  log() {",
+        '    echo "[$(date +%T)] $*"',
+        "  }",
+        "  trap 'log done' EXIT",
+        "  for f in /var/log/*.log; do",
+        '    gzip "$f"',
+        "  done",
+        "",
+        "```",
+        "Ensuite lance `kubectl get pods`",
+    ];
+
+    it("copies a script fence as one command", () => {
+        const results = scanCommands(script);
+        expect(results[0].command).toBe(
+            '#!/usr/bin/env bash\nset -euo pipefail\n\nlog() {\n  echo "[$(date +%T)] $*"\n}\ntrap \'log done\' EXIT\nfor f in /var/log/*.log; do\n  gzip "$f"\ndone'
+        );
+        expect(results[0].lineIndex).toBe(1);
+        expect(results[0].endLineIndex).toBe(10);
+        expect(results[1].command).toBe("kubectl get pods");
+    });
+
+    it("also treats a fence starting with set -e as a script", () => {
+        expect(commandsOf(["```bash", "set -e", "npm ci", "npm test", "```"])).toEqual(["set -e\nnpm ci\nnpm test"]);
+    });
+
+    it("keeps separate commands in a fence that is not a script", () => {
+        expect(commandsOf(["```bash", "npm ci", "npm test", "```"])).toEqual(["npm ci", "npm test"]);
+    });
+
+    it("does not glue a closing brace onto the previous line inside a fence", () => {
+        const lines = ["```bash", "  deploy() {", '    echo "go"', "  }", "  kubectl get pods", "```"];
+        expect(commandsOf(lines)).toEqual(['deploy() {\n  echo "go"\n}', "kubectl get pods"]);
+    });
+});
+
+describe("non-shell code blocks", () => {
+    const lines = [
+        "Voici le script Python :",
+        "```python",
+        "  def main():",
+        '      print("hello")',
+        "",
+        "  main()",
+        "```",
+        "```yaml",
+        "kind: ConfigMap",
+        "```",
+        "Puis `kubectl get pods`",
+    ];
+
+    it("are offered as whole blocks with their language", () => {
+        const results = scanCommands(lines);
+        expect(results.map((r) => [r.command, r.block?.lang ?? null, r.lineIndex, r.endLineIndex])).toEqual([
+            ['def main():\n    print("hello")\n\nmain()', "python", 2, 5],
+            ["kind: ConfigMap", "yaml", 8, 8],
+            ["kubectl get pods", null, 10, 10],
+        ]);
+    });
+
+    it("stay out of the detected commands panel", () => {
+        expect(commandsOf(lines)).toEqual(["kubectl get pods"]);
+    });
+
+    it("are ignored when the fence is never closed", () => {
+        expect(scanCommands(["```python", "print(1)", "", "suite du texte"])).toEqual([]);
+    });
+});
+
 describe("scanCommands", () => {
     it("reports every occurrence with its line range", () => {
         const lines = ["$ kubectl get pods", "output", "docker run \\", "  nginx", "kubectl get pods"];
@@ -363,6 +492,20 @@ function bashSyntaxError(script: string): string | null {
         return e?.stderr?.toString() || String(e);
     }
 }
+
+const script27 = [
+    "```bash",
+    "#!/usr/bin/env bash",
+    "set -euo pipefail",
+    "trap 'echo bye' EXIT",
+    "main() {",
+    "  for ns in $(kubectl get ns -o name); do",
+    '    echo "$ns"',
+    "  done",
+    "}",
+    'main "$@"',
+    "```",
+];
 
 describe("copied commands are shell-clean", () => {
     it("normalizes non-breaking spaces, zero-width marks and curly quotes", () => {
@@ -414,6 +557,8 @@ describe("copied commands are shell-clean", () => {
             ["```bash", "  kubectl top pods -A", "--sort-by=cpu", "```"],
             ['echo "a: b" > file.yml && cat file.yml'],
             ["FOO=bar npm run build -- --watch"],
+            script27,
+            ["  cat <<EOF > config.yaml", "  apiVersion: v1", "  kind: ConfigMap", "", "  EOF"],
         ];
         for (const lines of samples) {
             const cmds = commandsOf(lines);
@@ -422,6 +567,21 @@ describe("copied commands are shell-clean", () => {
                 expect(bashSyntaxError(cmd), cmd).toBeNull();
             }
         }
+    });
+});
+
+describe("filterCommands", () => {
+    const commands = extractCommands(["$ kubectl get pods -A", "$ helm list", "$ kubectl top nodes", "$ git status"]);
+    it("matches every term, case-insensitive", () => {
+        expect(filterCommands(commands, "KUBECTL").map((c) => c.command)).toEqual([
+            "kubectl get pods -A",
+            "kubectl top nodes",
+        ]);
+        expect(filterCommands(commands, "kubectl  nodes").map((c) => c.command)).toEqual(["kubectl top nodes"]);
+        expect(filterCommands(commands, "docker")).toEqual([]);
+    });
+    it("returns everything for an empty query", () => {
+        expect(filterCommands(commands, "   ")).toBe(commands);
     });
 });
 

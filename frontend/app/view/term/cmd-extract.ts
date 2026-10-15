@@ -13,6 +13,10 @@ export type DetectedCommand = {
 export type ScanOptions = {
     // terminal width, used to recognize lines soft-wrapped by a TUI
     cols?: number;
+    // Per line, [start, end) string offsets of text drawn in a different
+    // color than the rest of the line. TUIs render markdown inline code that
+    // way (colored, backticks dropped), so these runs stand in for spans.
+    styledRuns?: Array<Array<[number, number]>>;
 };
 
 export type CommandOccurrence = {
@@ -20,6 +24,8 @@ export type CommandOccurrence = {
     lineIndex: number;
     endLineIndex: number;
     inFence: boolean;
+    // a whole non-shell code block (python, yaml, ...) rather than a command
+    block?: { lang: string };
 };
 
 const MaxCommands = 50;
@@ -576,8 +582,10 @@ const TrailingDecorRegex = new RegExp(`[ ]?[${TrailingDecorChars}]+$`);
 const PromptRegex =
     /^(?:(?:\([^)]*\)|\[[^\]]*\])\s*)?(?:\S*[@:]\S*[$%#>❯➜→»]|\S+@\S+\s+[~/.\w][^\s]*\s?[$%#>❯](?=\s|$)|[\w.]+-\d[\w.]*[$#]|[$%>❯➜→»])\s?/;
 const VersionOutputRegex = /^\S+\s+version\s+\S*\d+\.\d+/i;
-// `if ...; then`, `for x in ...; do`, `case $x in`: shell syntax, not prose.
-const CompoundStartRegex = /^(?:if|for|while|until|case|select)\s.+(?:;\s*(?:then|do)|\sin)$/;
+// `if ...; then`, `for x in ...; do`, `case $x in`, `name() {`: shell syntax,
+// not prose.
+const CompoundStartRegex =
+    /^(?:(?:if|for|while|until|case|select)\s.+(?:;\s*(?:then|do)|\sin)|(?:function\s+)?[\w-]+\s*\(\)\s*\{)$/;
 const QuotedStringRegex = /"(?:[^"\\]|\\.)*"|'[^']*'/g;
 const BulletRegex = /^(?:[-*•‣▪◦]|\d+[.)])\s+/;
 // Line-number gutters from `cat -n`, `bat`, `nl`: `  12 │ cmd`, `  3<tab>cmd`.
@@ -614,6 +622,13 @@ const WrapperOptValueRegex = /^\d+(?:\.\d+)?[smhd]?$/;
 // sudo -u/-g, watch/nice -n, timeout -s/-k, env -C/-S, stdbuf -o/-e.
 const WrapperValueFlags = new Set(["-u", "-g", "-n", "-s", "-k", "-C", "-S", "-o", "-e"]);
 const LeadingQuoteRegex = /^["'`]+/;
+// `cat <<EOF`, `cat <<-'EOF'`, `tee x <<"END"` (but not the `<<<` here-string)
+const HeredocRegex = /(?:^|[^<])<<-?\s*(["']?)([A-Za-z_][\w-]*)\1/;
+// `kind: ConfigMap`, `name: app`: YAML/config lines, never a command
+const KeyValueTokenRegex = /^[\w.-]+:$/;
+// A fence that opens with a shebang or `set -e...` is a script meant to be
+// run as a whole, not a list of independent commands.
+const ScriptStartRegex = /^(?:#!|set\s+-[a-zA-Z]*e)/;
 
 function stripAnsi(line: string): string {
     if (!line.includes("\x1b")) {
@@ -781,6 +796,9 @@ function acceptsAsCommand(candidate: string, inFence: boolean, fenceLang: string
     if (firstToken == null || firstToken == "") {
         return false;
     }
+    if (KeyValueTokenRegex.test(firstToken)) {
+        return false;
+    }
     const basename = firstToken.split("/").pop();
     if (basename == null || basename == "" || basename == "." || basename == "..") {
         return false;
@@ -836,12 +854,37 @@ function acceptsAsCommand(candidate: string, inFence: boolean, fenceLang: string
 // `&&`, `|` continuations and multi-line compound commands (`while ...; do` up
 // to `done`). An unclosed block is not joined, so a stray `do` cannot swallow
 // the prose that follows it.
+// Heredoc bodies are literal text (blank lines and indentation included) up
+// to the line holding only the delimiter. Without a terminator in range the
+// first line is returned alone rather than swallowing what follows.
+function readHeredoc(
+    lines: string[],
+    startLine: number,
+    candidate: string,
+    delimiter: string
+): { command: string; lastLine: number } {
+    const baseIndent = leadingIndent(lines[startLine]);
+    let joined = candidate;
+    for (let j = startLine + 1; j < lines.length && j - startLine <= MaxQuotedLines; j++) {
+        const raw = sanitizeLine(lines[j]);
+        if (raw.trim() == delimiter) {
+            return { command: joined + "\n" + delimiter, lastLine: j };
+        }
+        joined += "\n" + cleanContinuationLine(lines[j], baseIndent);
+    }
+    return { command: candidate, lastLine: startLine };
+}
+
 function readContinuation(
     lines: string[],
     startLine: number,
     candidate: string,
     inFence: boolean
 ): { command: string; lastLine: number } {
+    const heredoc = candidate.match(HeredocRegex);
+    if (heredoc != null) {
+        return readHeredoc(lines, startLine, candidate, heredoc[2]);
+    }
     let depth = blockDepthDelta(candidate);
     if (!ContinuationRegex.test(candidate) && depth <= 0) {
         return { command: candidate, lastLine: startLine };
@@ -931,7 +974,9 @@ function readSoftWrap(
         const firstToken = next.split(/\s+/)[0];
         const widthOverflow = cols != null && displayedWidth(lines[j - 1]) + 1 + firstToken.length > cols;
         // a TUI wraps onto column 0 while the command itself was indented
-        const indentDrop = firstIndent > 0 && leadingIndent(lines[j]) < firstIndent;
+        // only outside fences: in code a lower indent is ordinary structure
+        // (closing `}`, `done`), not a TUI-wrapped tail
+        const indentDrop = !inFence && firstIndent > 0 && leadingIndent(lines[j]) < firstIndent;
         const isFlag = SoftWrapFlagRegex.test(next);
         if (!isFlag && !widthOverflow && !indentDrop) {
             break;
@@ -954,6 +999,79 @@ function readSoftWrap(
     return { command, lastLine };
 }
 
+// The whole body of a shell fence that starts like a script, comments and
+// blank lines included, dedented to its first line. Null when the fence is
+// not a script or is never closed in range.
+function isShellFence(lang: string): boolean {
+    return lang == "" || SHELL_FENCE_LANGS.has(lang);
+}
+
+function readFencedScript(
+    lines: string[],
+    fenceLine: number,
+    marker: string,
+    lang: string
+): { command: string; lineIndex: number; endLineIndex: number } | null {
+    if (!isShellFence(lang)) {
+        return null;
+    }
+    let first = fenceLine + 1;
+    while (first < lines.length && sanitizeLine(lines[first]).trim() == "") {
+        first++;
+    }
+    if (first >= lines.length) {
+        return null;
+    }
+    const firstText = sanitizeLine(lines[first]).replace(LeadingDecorRegex, "").trim();
+    if (!ScriptStartRegex.test(firstText)) {
+        return null;
+    }
+    return readFenceBody(lines, first, marker);
+}
+
+// Body of a code fence from `first` to the last non-blank line before the
+// closing marker, dedented to its first line. Null when the fence is never
+// closed in range: better nothing than a block that swallows the answer.
+function readFenceBody(
+    lines: string[],
+    first: number,
+    marker: string
+): { command: string; lineIndex: number; endLineIndex: number } | null {
+    const baseIndent = leadingIndent(lines[first]);
+    const body: string[] = [];
+    for (let j = first; j < lines.length && j - first <= MaxQuotedLines; j++) {
+        const fence = parseFenceMarker(cleanCommandLine(lines[j]), true);
+        if (fence != null && fence.closes && fence.marker[0] == marker) {
+            let last = j - 1;
+            while (last > first && sanitizeLine(lines[last]).trim() == "") {
+                last--;
+            }
+            return {
+                command: finalizeCommand(body.slice(0, last - first + 1).join("\n")),
+                lineIndex: first,
+                endLineIndex: last,
+            };
+        }
+        body.push(cleanContinuationLine(lines[j], baseIndent));
+    }
+    return null;
+}
+
+function readCodeBlock(
+    lines: string[],
+    fenceLine: number,
+    marker: string
+): { command: string; lineIndex: number; endLineIndex: number } | null {
+    let first = fenceLine + 1;
+    while (first < lines.length && sanitizeLine(lines[first]).trim() == "") {
+        first++;
+    }
+    if (first >= lines.length || parseFenceMarker(cleanCommandLine(lines[first]), true) != null) {
+        return null;
+    }
+    return readFenceBody(lines, first, marker);
+}
+
 // Every command occurrence in order, without dedup. Used directly by the hover
 // overlay, which needs the exact line range of each occurrence.
 export function scanCommands(lines: string[], opts?: ScanOptions): CommandOccurrence[] {
@@ -969,6 +1087,18 @@ export function scanCommands(lines: string[], opts?: ScanOptions): CommandOccurr
         const fence = parseFenceMarker(cleaned, inFence);
         if (fence != null) {
             if (!inFence) {
+                const script = readFencedScript(lines, i, fence.marker[0], fence.info);
+                if (script != null) {
+                    results.push({ ...script, inFence: true });
+                    i = script.endLineIndex + 1;
+                    continue;
+                }
+                const block = isShellFence(fence.info) ? null : readCodeBlock(lines, i, fence.marker[0]);
+                if (block != null) {
+                    results.push({ ...block, inFence: true, block: { lang: fence.info } });
+                    i = block.endLineIndex + 1;
+                    continue;
+                }
                 inFence = true;
                 fenceMarker = fence.marker[0];
                 fenceLang = fence.info;
@@ -980,6 +1110,7 @@ export function scanCommands(lines: string[], opts?: ScanOptions): CommandOccurr
         }
         const candidates = extractCandidates(cleaned);
         const fromSpans = candidates.length > 1 || candidates[0] != cleaned;
+        const foundBefore = results.length;
         let lastLine = i;
         for (const candidate of candidates) {
             if (!fromSpans && CompoundStartRegex.test(candidate)) {
@@ -1009,28 +1140,66 @@ export function scanCommands(lines: string[], opts?: ScanOptions): CommandOccurr
             lastLine = cont.lastLine;
             results.push({ command: finalizeCommand(cont.command), lineIndex: i, endLineIndex: lastLine, inFence });
         }
+        // Fences are syntax-highlighted token by token, so color runs are only
+        // meaningful in prose, and only when nothing else matched the line.
+        const runs = opts?.styledRuns?.[i];
+        if (results.length == foundBefore && !inFence && !cleaned.includes("`") && runs != null) {
+            for (const [start, end] of runs) {
+                const run = sanitizeLine(lines[i].slice(start, end)).trim();
+                // TUIs also color file paths and names in prose; a lone word
+                // only counts when it is a known program (`htop`)
+                const single = !/\s/.test(run);
+                if (single && !KNOWN_COMMANDS.has(run.split("/").pop() ?? "")) {
+                    continue;
+                }
+                if (acceptsAsCommand(run, false, "")) {
+                    results.push({ command: finalizeCommand(run), lineIndex: i, endLineIndex: i, inFence });
+                }
+            }
+        }
         i = lastLine;
     }
     return results;
 }
 
+// Unique commands in chronological order (oldest first). Each entry points at
+// its latest occurrence, and when the cap is hit the most recent commands are
+// the ones kept: on a long scrollback the old ones matter least.
 export function extractCommands(lines: string[], opts?: ScanOptions): DetectedCommand[] {
-    const results: DetectedCommand[] = [];
+    const newestFirst: DetectedCommand[] = [];
     const byCommand = new Map<string, DetectedCommand>();
-    for (const occ of scanCommands(lines, opts)) {
+    // code blocks are offered on hover only; the panel lists commands
+    const occurrences = scanCommands(lines, opts).filter((occ) => occ.block == null);
+    for (let i = occurrences.length - 1; i >= 0; i--) {
+        const occ = occurrences[i];
         const existing = byCommand.get(occ.command);
         if (existing != null) {
             existing.count++;
             continue;
         }
-        if (results.length >= MaxCommands) {
+        if (newestFirst.length >= MaxCommands) {
             continue;
         }
-        const detected: DetectedCommand = { id: `cmd-${occ.lineIndex}-${results.length}`, ...occ, count: 1 };
+        const detected: DetectedCommand = { id: `cmd-${occ.lineIndex}-${i}`, ...occ, count: 1 };
         byCommand.set(occ.command, detected);
-        results.push(detected);
+        newestFirst.push(detected);
     }
-    return results;
+    return newestFirst.reverse();
+}
+
+// Case-insensitive match where every whitespace-separated term must appear.
+export function filterCommands(commands: DetectedCommand[], query: string): DetectedCommand[] {
+    const terms = query
+        .toLowerCase()
+        .split(/\s+/)
+        .filter((t) => t != "");
+    if (terms.length == 0) {
+        return commands;
+    }
+    return commands.filter((c) => {
+        const text = c.command.toLowerCase();
+        return terms.every((t) => text.includes(t));
+    });
 }
 
 export function commandsToCopyText(commands: DetectedCommand[]): string {

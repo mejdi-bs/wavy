@@ -40,14 +40,9 @@ import { boundNumber, fireAndForget, stringToBase64 } from "@/util/util";
 import * as jotai from "jotai";
 import * as React from "react";
 import { extractCommands, type DetectedCommand } from "./cmd-extract";
+import { readBufferText } from "./cmd-hover-layout";
 import { getBlockingCommand } from "./shellblocking";
-import {
-    bufferLinesToText,
-    computeTheme,
-    DefaultTermTheme,
-    isLikelyOnSameHost,
-    trimTerminalSelection,
-} from "./termutil";
+import { computeTheme, DefaultTermTheme, isLikelyOnSameHost, trimTerminalSelection } from "./termutil";
 import { TermWrap, WebGLSupported } from "./termwrap";
 
 const MaxCmdExtractScanLines = 5000;
@@ -851,8 +846,8 @@ export class TermViewModel implements ViewModel {
         // buffer, so scanning only the normal buffer misses everything they show
         const buffer = termWrap.terminal.buffer.active;
         const start = Math.max(0, buffer.length - MaxCmdExtractScanLines);
-        const lines = bufferLinesToText(buffer, start, buffer.length);
-        return extractCommands(lines, { cols: termWrap.terminal.cols });
+        const text = readBufferText(buffer, start, buffer.length);
+        return extractCommands(text.lines, { cols: termWrap.terminal.cols, styledRuns: text.styledRuns });
     }
 
     getContextMenuItems(): ContextMenuItem[] {
