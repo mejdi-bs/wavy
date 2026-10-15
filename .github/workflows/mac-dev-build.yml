@@ -41,6 +41,15 @@ jobs:
                     p.productName="Wave Dev";p.build=p.build||{};p.build.appId="dev.commandline.waveterm.dev";
                     fs.writeFileSync("package.json",JSON.stringify(p,null,4)+"\n");'
                   grep -E '"productName"|"appId"' package.json
+                  # Separate data dir + single-instance lock so it never hands off to official Wave
+                  f=emain/emain-platform.ts
+                  sed -i '' \
+                    -e 's|app.setName("waveterm/electron")|app.setName("waveterm-wavy/electron")|' \
+                    -e 's|envPaths("waveterm"|envPaths("waveterm-wavy"|' \
+                    -e 's|const waveDirNamePrefix = "waveterm";|const waveDirNamePrefix = "waveterm-wavy";|' \
+                    -e 's|app.setName(isDev ? "Wave (Dev)" : "Wave");|app.setName("Wave Dev");|' "$f"
+                  grep -n 'waveterm-wavy\|"Wave Dev"' "$f"
+                  test "$(grep -c 'waveterm-wavy\|"Wave Dev"' "$f")" -ge 4
             - name: Build (arm64 dmg, ad-hoc signed, no notarization)
               run: task package -- --mac dmg --arm64 -c.mac.identity=- -c.mac.notarize=false
               env:
