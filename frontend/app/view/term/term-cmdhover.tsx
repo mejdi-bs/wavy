@@ -71,6 +71,7 @@ export const TermCmdHover = React.memo(function TermCmdHover({ termWrap }: TermC
             }
             const screenRect = getScreenRect(terminal);
             if (screenRect == null) {
+                scheduleHide();
                 return;
             }
             const col = Math.floor(((lastMouse.x - screenRect.left) / screenRect.width) * terminal.cols);
@@ -162,7 +163,7 @@ export const TermCmdHover = React.memo(function TermCmdHover({ termWrap }: TermC
                     onMouseLeave={scheduleHide}
                 >
                     <CopyButton
-                        title={box.partial ? "Copy (partially visible command)" : "Copy command"}
+                        title="Copy command"
                         onClick={() => {
                             navigator.clipboard.writeText(box.command).catch((err) => {
                                 console.error("copy command failed", err);

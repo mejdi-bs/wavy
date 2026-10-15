@@ -148,7 +148,7 @@ const TrailingDecorRegex = new RegExp(`[ ]?[${TrailingDecorChars}]+$`);
 // bash default `bash-3.2$`.
 const PromptRegex =
     /^(?:(?:\([^)]*\)|\[[^\]]*\])\s*)?(?:\S*[@:]\S*[$%#>❯➜→»]|\S+@\S+\s+[~/.\w][^\s]*\s?[$%#>❯](?=\s|$)|[\w.]+-\d[\w.]*[$#]|[$%>❯➜→»])\s?/;
-const VersionOutputRegex = /^\S+\s+version\s+v?\d/i;
+const VersionOutputRegex = /^\S+\s+version\s+\S*\d+\.\d+/i;
 // `if ...; then`, `for x in ...; do`, `case $x in`: shell syntax, not prose.
 const CompoundStartRegex = /^(?:if|for|while|until|case|select)\s.+(?:;\s*(?:then|do)|\sin)$/;
 const QuotedStringRegex = /"(?:[^"\\]|\\.)*"|'[^']*'/g;
@@ -306,7 +306,11 @@ function acceptsAsCommand(candidate: string, inFence: boolean, fenceLang: string
     if (basename == null || basename == "" || basename == "." || basename == "..") {
         return false;
     }
-    if (LOGGING_TOOLS.has(basename) && effective.length > 1 && LOG_LEVEL_WORDS.has(effective[1].toLowerCase())) {
+    if (
+        LOGGING_TOOLS.has(basename) &&
+        effective.length > 1 &&
+        LOG_LEVEL_WORDS.has(effective[1].toLowerCase().replace(/:$/, ""))
+    ) {
         return false;
     }
     if (VersionOutputRegex.test(candidate)) {

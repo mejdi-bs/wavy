@@ -24,7 +24,6 @@ export type HoverBox = {
     top: number;
     width: number;
     height: number;
-    partial: boolean;
 };
 
 export function readViewportText(buffer: TermTypes.IBuffer, viewportY: number, rows: number): ViewportText {
@@ -36,7 +35,10 @@ export function readViewportText(buffer: TermTypes.IBuffer, viewportY: number, r
         if (line == null) {
             continue;
         }
-        const lineText = line.translateToString(true);
+        // a row that wraps into the next one must keep its trailing spaces,
+        // otherwise column offsets into the joined logical line drift
+        const wrapsOn = buffer.getLine(row + 1)?.isWrapped ?? false;
+        const lineText = line.translateToString(!wrapsOn);
         const last = text.lines.length - 1;
         if (line.isWrapped && last >= 0) {
             text.lines[last] += lineText;
@@ -138,7 +140,6 @@ export function computeBox(
         top: screenRect.top + (visFirst - viewportY) * cellH,
         width: right - left,
         height: (visLast - visFirst + 1) * cellH,
-        partial: visFirst != first || visLast != last,
     };
 }
 

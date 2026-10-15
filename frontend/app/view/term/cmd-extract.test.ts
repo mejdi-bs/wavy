@@ -220,6 +220,9 @@ describe("extractCommands real-world prompts and output", () => {
         expect(commandsOf(["npm warn deprecated glob@7.2.3: Old versions of glob are not supported"])).toEqual([]);
         expect(commandsOf(["npm ERR! code ENOENT"])).toEqual([]);
         expect(commandsOf(["git version 2.45.0"])).toEqual([]);
+        expect(commandsOf(["go version go1.26.8 darwin/arm64"])).toEqual([]);
+        expect(commandsOf(["yarn error: Couldn't find package"])).toEqual([]);
+        expect(commandsOf(["npm version patch"])).toEqual(["npm version patch"]);
         expect(commandsOf(["npm info react"])).toEqual(["npm info react"]);
         expect(commandsOf(["go version"])).toEqual(["go version"]);
         expect(commandsOf(["grep error app.log"])).toEqual(["grep error app.log"]);

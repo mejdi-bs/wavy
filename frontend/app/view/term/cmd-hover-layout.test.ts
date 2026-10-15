@@ -11,7 +11,10 @@ function fakeBuffer(rows: FakeRow[]): any {
         getLine: (i: number) =>
             rows[i] == null
                 ? undefined
-                : { isWrapped: rows[i].wrapped ?? false, translateToString: () => rows[i].text },
+                : {
+                      isWrapped: rows[i].wrapped ?? false,
+                      translateToString: (trimRight: boolean) => (trimRight ? rows[i].text.trimEnd() : rows[i].text),
+                  },
     };
 }
 
@@ -37,10 +40,18 @@ describe("term-cmdhover viewport mapping", () => {
         const buffer = fakeBuffer([{ text: "kubectl get pods --all-name" }, { text: "spaces -o wide", wrapped: true }]);
         const text = readViewportText(buffer, 0, 2);
         expect(text.lines).toEqual(["kubectl get pods --all-namespaces -o wide"]);
+        expect(text.startRows).toEqual([0]);
+        expect(text.rowCounts).toEqual([2]);
         const occurrences = scanCommands(text.lines);
         expect(findHoveredOccurrence(text, occurrences, 1, 3, 27)?.command).toBe(
             "kubectl get pods --all-namespaces -o wide"
         );
+    });
+
+    it("keeps the trailing space of a row that wraps so offsets stay aligned", () => {
+        const buffer = fakeBuffer([{ text: "docker run " }, { text: "nginx", wrapped: true }]);
+        const text = readViewportText(buffer, 0, 2);
+        expect(text.lines).toEqual(["docker run nginx"]);
     });
 
     it("picks the inline command under the mouse when a line has several", () => {
