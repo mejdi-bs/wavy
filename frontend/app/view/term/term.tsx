@@ -22,6 +22,7 @@ import debug from "debug";
 import * as jotai from "jotai";
 import * as React from "react";
 import { DetectedCommandsPanel } from "./term-cmdextract";
+import { TermCmdHover } from "./term-cmdhover";
 import { TermLinkTooltip } from "./term-tooltip";
 import { TermStickers } from "./termsticker";
 import { TermThemeUpdater } from "./termtheme";
@@ -396,6 +397,9 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
             <div key="connect-elem" className="term-connectelem" ref={connectElemRef} />
             <NullErrorBoundary debugName="TermLinkTooltip">
                 <TermLinkTooltip termWrap={termWrapInst} />
+            </NullErrorBoundary>
+            <NullErrorBoundary debugName="TermCmdHover">
+                <TermCmdHover termWrap={termWrapInst} />
             </NullErrorBoundary>
             <DetectedCommandsPanel model={model} />
             <Search {...searchProps} />

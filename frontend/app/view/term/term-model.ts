@@ -39,10 +39,16 @@ import { isMacOS, isWindows } from "@/util/platformutil";
 import { boundNumber, fireAndForget, stringToBase64 } from "@/util/util";
 import * as jotai from "jotai";
 import * as React from "react";
-import { getBlockingCommand } from "./shellblocking";
-import { bufferLinesToText, computeTheme, DefaultTermTheme, isLikelyOnSameHost, trimTerminalSelection } from "./termutil";
-import { TermWrap, WebGLSupported } from "./termwrap";
 import { extractCommands, type DetectedCommand } from "./cmd-extract";
+import { getBlockingCommand } from "./shellblocking";
+import {
+    bufferLinesToText,
+    computeTheme,
+    DefaultTermTheme,
+    isLikelyOnSameHost,
+    trimTerminalSelection,
+} from "./termutil";
+import { TermWrap, WebGLSupported } from "./termwrap";
 
 const MaxCmdExtractScanLines = 5000;
 
@@ -838,9 +844,11 @@ export class TermViewModel implements ViewModel {
 
     getDetectedCommands(): DetectedCommand[] {
         const termWrap = this.termRef.current;
-        if (termWrap == null || termWrap.terminal.buffer.active.type != "normal") {
+        if (termWrap == null) {
             return [];
         }
+        // full-screen TUIs (Claude Code, codex, ...) render on the alternate
+        // buffer, so scanning only the normal buffer misses everything they show
         const buffer = termWrap.terminal.buffer.active;
         const start = Math.max(0, buffer.length - MaxCmdExtractScanLines);
         const lines = bufferLinesToText(buffer, start, buffer.length);

@@ -8,6 +8,7 @@
     "app:confirmquit": true,
     "app:hideaibutton": false,
     "term:showsplitbuttons": false,
+    "term:cmdhover": true,
     "app:disablectrlshiftarrows": false,
     "app:disablectrlshiftdisplay": false,
     "app:focusfollowscursor": "off",

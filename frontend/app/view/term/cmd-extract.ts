@@ -5,8 +5,16 @@ export type DetectedCommand = {
     id: string;
     command: string;
     lineIndex: number;
+    endLineIndex: number;
     inFence: boolean;
     count: number;
+};
+
+export type CommandOccurrence = {
+    command: string;
+    lineIndex: number;
+    endLineIndex: number;
+    inFence: boolean;
 };
 
 const MaxCommands = 50;
@@ -82,6 +90,19 @@ const WRAPPERS = new Set([
     "command", "builtin", "exec", "time",
 ]);
 
+// Package managers print log lines that start with their own name
+// ("npm warn deprecated ...", "brew error ..."), which would otherwise pass as
+// known-binary commands. "info" stays out: `npm info react` is a real command.
+const LOGGING_TOOLS = new Set(["npm", "yarn", "pnpm", "pip", "pip3", "brew", "gem", "composer"]);
+const LOG_LEVEL_WORDS = new Set([
+    "warn", "warning", "error", "err!", "notice", "verb", "verbose", "sill", "silly", "timing", "fatal",
+    "deprecated",
+]);
+
+// Shell keywords that open/close a compound command spanning several lines.
+const BLOCK_OPEN_WORDS = new Set(["do", "if", "case", "{"]);
+const BLOCK_CLOSE_WORDS = new Set(["done", "fi", "esac", "}"]);
+
 const SHELL_FENCE_LANGS = new Set([
     "sh", "bash", "zsh", "shell", "shellsession", "shell-session", "console", "terminal", "fish",
     "ksh", "dash", "console-session",
@@ -122,8 +143,15 @@ const TrailingDecorRegex = new RegExp(`[ ]?[${TrailingDecorChars}]+$`);
 // Matches shell prompt prefixes: bare `$`/`%`/`>` prompts, powerline arrows,
 // and the tail of `user@host:~$`, `(venv) user@host:~$`, `root@box:~#`, or
 // `C:\>` style prompts. `#` is only a prompt char when a user@host/path
-// prefix precedes it; a bare `#` is far more often a comment.
-const PromptRegex = /^(?:(?:\([^)]*\)|\[[^\]]*\])\s*)?(?:\S*[@:]\S*[$%#>❯➜→»]|[$%>❯➜→»])\s?/;
+// prefix precedes it; a bare `#` is far more often a comment. Also covers the
+// macOS zsh default `user@host ~/dir %` (cwd separated by a space) and the
+// bash default `bash-3.2$`.
+const PromptRegex =
+    /^(?:(?:\([^)]*\)|\[[^\]]*\])\s*)?(?:\S*[@:]\S*[$%#>❯➜→»]|\S+@\S+\s+[~/.\w][^\s]*\s?[$%#>❯](?=\s|$)|[\w.]+-\d[\w.]*[$#]|[$%>❯➜→»])\s?/;
+const VersionOutputRegex = /^\S+\s+version\s+v?\d/i;
+// `if ...; then`, `for x in ...; do`, `case $x in`: shell syntax, not prose.
+const CompoundStartRegex = /^(?:if|for|while|until|case|select)\s.+(?:;\s*(?:then|do)|\sin)$/;
+const QuotedStringRegex = /"(?:[^"\\]|\\.)*"|'[^']*'/g;
 const BulletRegex = /^(?:[-*•‣▪◦]|\d+[.)])\s+/;
 const FenceRegex = /^(`{3,}|~{3,})(.*)$/;
 const BacktickSpanRegex = /`([^`]+)`/g;
@@ -165,12 +193,33 @@ export function cleanCommandLine(rawLine: string): string {
 
 // Continuation lines keep their leading whitespace — it is part of the
 // command's verbatim content — but still lose gutter decoration.
-function cleanContinuationLine(rawLine: string): string {
+// The first line's indent (e.g. the 2-space margin Claude Code puts in front
+// of every response line) is removed so nested lines keep only their
+// relative indentation.
+function cleanContinuationLine(rawLine: string, baseIndent: number): string {
     let line = stripAnsi(rawLine).replace(TrailingDecorRegex, "").trimEnd();
     if (!/^\s/.test(line)) {
         line = line.replace(LeadingDecorRegex, "");
     }
-    return line.trimEnd();
+    const indent = line.length - line.trimStart().length;
+    return line.slice(Math.min(indent, baseIndent)).trimEnd();
+}
+
+function leadingIndent(rawLine: string): number {
+    const line = stripAnsi(rawLine).replace(LeadingDecorRegex, "");
+    return line.length - line.trimStart().length;
+}
+
+function blockDepthDelta(line: string): number {
+    let delta = 0;
+    for (const word of line.replace(QuotedStringRegex, "").split(/[\s;&|()]+/)) {
+        if (BLOCK_OPEN_WORDS.has(word)) {
+            delta++;
+        } else if (BLOCK_CLOSE_WORDS.has(word)) {
+            delta--;
+        }
+    }
+    return delta;
 }
 
 type FenceMarker = { marker: string; info: string; closes: boolean };
@@ -257,6 +306,12 @@ function acceptsAsCommand(candidate: string, inFence: boolean, fenceLang: string
     if (basename == null || basename == "" || basename == "." || basename == "..") {
         return false;
     }
+    if (LOGGING_TOOLS.has(basename) && effective.length > 1 && LOG_LEVEL_WORDS.has(effective[1].toLowerCase())) {
+        return false;
+    }
+    if (VersionOutputRegex.test(candidate)) {
+        return false;
+    }
     if (KNOWN_COMMANDS.has(basename)) {
         return true;
     }
@@ -294,77 +349,111 @@ function acceptsAsCommand(candidate: string, inFence: boolean, fenceLang: string
     return /^[.~/]/.test(firstToken);
 }
 
-export function extractCommands(lines: string[]): DetectedCommand[] {
-    const results: DetectedCommand[] = [];
-    const byCommand = new Map<string, DetectedCommand>();
+// Joins the lines that belong to the command starting at `startLine`: `\`,
+// `&&`, `|` continuations and multi-line compound commands (`while ...; do` up
+// to `done`). An unclosed block is not joined, so a stray `do` cannot swallow
+// the prose that follows it.
+function readContinuation(
+    lines: string[],
+    startLine: number,
+    candidate: string,
+    inFence: boolean
+): { command: string; lastLine: number } {
+    let depth = blockDepthDelta(candidate);
+    if (!ContinuationRegex.test(candidate) && depth <= 0) {
+        return { command: candidate, lastLine: startLine };
+    }
+    const baseIndent = leadingIndent(lines[startLine]);
+    let joined = candidate;
+    let lastLine = startLine;
+    for (let j = startLine + 1; j < lines.length && j - startLine <= MaxContinuationLines; j++) {
+        if (parseFenceMarker(stripAnsi(lines[j]).trim(), inFence) != null) {
+            break;
+        }
+        const next = cleanContinuationLine(lines[j], baseIndent);
+        if (next.trim() == "") {
+            break;
+        }
+        joined += "\n" + next;
+        lastLine = j;
+        depth += blockDepthDelta(next);
+        if (depth <= 0 && !ContinuationRegex.test(next)) {
+            break;
+        }
+    }
+    if (depth > 0) {
+        return { command: candidate, lastLine: startLine };
+    }
+    return { command: joined, lastLine };
+}
+
+// Every command occurrence in order, without dedup. Used directly by the hover
+// overlay, which needs the exact line range of each occurrence.
+export function scanCommands(lines: string[]): CommandOccurrence[] {
+    const results: CommandOccurrence[] = [];
     let inFence = false;
     let fenceMarker = "";
     let fenceLang = "";
-    let i = 0;
-    while (i < lines.length) {
+    for (let i = 0; i < lines.length; i++) {
         const cleaned = cleanCommandLine(lines[i]);
-        if (cleaned != "") {
-            const fence = parseFenceMarker(cleaned, inFence);
-            if (fence != null) {
-                if (!inFence) {
-                    inFence = true;
-                    fenceMarker = fence.marker[0];
-                    fenceLang = fence.info;
-                } else if (fence.closes && fence.marker[0] == fenceMarker) {
-                    inFence = false;
-                    fenceLang = "";
+        if (cleaned == "") {
+            continue;
+        }
+        const fence = parseFenceMarker(cleaned, inFence);
+        if (fence != null) {
+            if (!inFence) {
+                inFence = true;
+                fenceMarker = fence.marker[0];
+                fenceLang = fence.info;
+            } else if (fence.closes && fence.marker[0] == fenceMarker) {
+                inFence = false;
+                fenceLang = "";
+            }
+            continue;
+        }
+        const candidates = extractCandidates(cleaned);
+        const fromSpans = candidates.length > 1 || candidates[0] != cleaned;
+        let lastLine = i;
+        for (const candidate of candidates) {
+            if (!fromSpans && CompoundStartRegex.test(candidate)) {
+                const cont = readContinuation(lines, i, candidate, inFence);
+                if (cont.lastLine > i) {
+                    lastLine = cont.lastLine;
+                    results.push({ command: cont.command, lineIndex: i, endLineIndex: lastLine, inFence });
                 }
-                i++;
                 continue;
             }
-            if (results.length < MaxCommands) {
-                const candidates = extractCandidates(cleaned);
-                for (const candidate of candidates) {
-                    if (!acceptsAsCommand(candidate, inFence, fenceLang)) {
-                        continue;
-                    }
-                    let command = candidate;
-                    let lastLine = i;
-                    if (ContinuationRegex.test(candidate)) {
-                        let j = i + 1;
-                        let joined = candidate;
-                        while (j < lines.length && j - i <= MaxContinuationLines) {
-                            if (parseFenceMarker(stripAnsi(lines[j]).trim(), inFence) != null) {
-                                break;
-                            }
-                            const next = cleanContinuationLine(lines[j]);
-                            if (next == "") {
-                                break;
-                            }
-                            joined += "\n" + next;
-                            lastLine = j;
-                            j++;
-                            if (!ContinuationRegex.test(next)) {
-                                break;
-                            }
-                        }
-                        command = joined;
-                    }
-                    const existing = byCommand.get(command);
-                    if (existing != null) {
-                        existing.count++;
-                    } else {
-                        const detected: DetectedCommand = {
-                            id: `cmd-${i}`,
-                            command: command,
-                            lineIndex: i,
-                            inFence: inFence,
-                            count: 1,
-                        };
-                        byCommand.set(command, detected);
-                        results.push(detected);
-                    }
-                    i = lastLine;
-                    break;
-                }
+            if (!acceptsAsCommand(candidate, inFence, fenceLang)) {
+                continue;
             }
+            if (fromSpans) {
+                results.push({ command: candidate, lineIndex: i, endLineIndex: i, inFence });
+                continue;
+            }
+            const cont = readContinuation(lines, i, candidate, inFence);
+            lastLine = cont.lastLine;
+            results.push({ command: cont.command, lineIndex: i, endLineIndex: lastLine, inFence });
         }
-        i++;
+        i = lastLine;
+    }
+    return results;
+}
+
+export function extractCommands(lines: string[]): DetectedCommand[] {
+    const results: DetectedCommand[] = [];
+    const byCommand = new Map<string, DetectedCommand>();
+    for (const occ of scanCommands(lines)) {
+        const existing = byCommand.get(occ.command);
+        if (existing != null) {
+            existing.count++;
+            continue;
+        }
+        if (results.length >= MaxCommands) {
+            continue;
+        }
+        const detected: DetectedCommand = { id: `cmd-${occ.lineIndex}-${results.length}`, ...occ, count: 1 };
+        byCommand.set(occ.command, detected);
+        results.push(detected);
     }
     return results;
 }

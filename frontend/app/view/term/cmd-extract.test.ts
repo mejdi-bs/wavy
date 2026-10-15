@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { cleanCommandLine, commandsToCopyText, extractCommands } from "./cmd-extract";
+import { cleanCommandLine, commandsToCopyText, extractCommands, scanCommands } from "./cmd-extract";
 
 function commandsOf(lines: string[]): string[] {
     return extractCommands(lines).map((c) => c.command);
@@ -101,7 +101,15 @@ describe("extractCommands fenced code blocks", () => {
     });
 
     it("does not leak fence state across separate blocks", () => {
-        const lines = ["```bash", "kubectl get pods", "```", "plain prose about things", "```bash", "npm install", "```"];
+        const lines = [
+            "```bash",
+            "kubectl get pods",
+            "```",
+            "plain prose about things",
+            "```bash",
+            "npm install",
+            "```",
+        ];
         expect(commandsOf(lines)).toEqual(["kubectl get pods", "npm install"]);
     });
 });
@@ -192,6 +200,73 @@ describe("extractCommands limits", () => {
     it("rejects overly long or token-heavy lines", () => {
         expect(commandsOf([`curl ${"a".repeat(600)}`])).toEqual([]);
         expect(commandsOf(["kubectl " + Array.from({ length: 40 }, (_, i) => `arg${i}`).join(" ")])).toEqual([]);
+    });
+});
+
+describe("extractCommands real-world prompts and output", () => {
+    it("strips the macOS zsh and bash default prompts", () => {
+        expect(cleanCommandLine("user@mac ~/wave % npm ci --ignore-scripts")).toBe("npm ci --ignore-scripts");
+        expect(cleanCommandLine("user@mac ~ % git status")).toBe("git status");
+        expect(cleanCommandLine("bash-3.2$ ls -la")).toBe("ls -la");
+        expect(commandsOf(["user@mac ~/wave % git status"])).toEqual(["git status"]);
+    });
+
+    it("keeps ssh/scp targets that look like user@host", () => {
+        expect(cleanCommandLine("ssh user@host ls -la")).toBe("ssh user@host ls -la");
+        expect(cleanCommandLine("scp file.txt user@host:/tmp")).toBe("scp file.txt user@host:/tmp");
+    });
+
+    it("rejects package manager log lines and version output", () => {
+        expect(commandsOf(["npm warn deprecated glob@7.2.3: Old versions of glob are not supported"])).toEqual([]);
+        expect(commandsOf(["npm ERR! code ENOENT"])).toEqual([]);
+        expect(commandsOf(["git version 2.45.0"])).toEqual([]);
+        expect(commandsOf(["npm info react"])).toEqual(["npm info react"]);
+        expect(commandsOf(["go version"])).toEqual(["go version"]);
+        expect(commandsOf(["grep error app.log"])).toEqual(["grep error app.log"]);
+    });
+
+    it("keeps every backtick command on a line", () => {
+        expect(commandsOf(["Run `kubectl get pods -n prod` then `helm list`"])).toEqual([
+            "kubectl get pods -n prod",
+            "helm list",
+        ]);
+    });
+});
+
+describe("extractCommands compound commands", () => {
+    it("joins a while/do block and removes the response margin", () => {
+        const lines = [
+            "  kubectl config get-contexts -o name | while read ctx; do",
+            '    echo "=== $ctx ==="',
+            '    kubectl --context "$ctx" get pods -A',
+            "  done",
+            "",
+            "  Astuce : kubectl get pods -A est le réflexe standard.",
+        ];
+        expect(commandsOf(lines)).toEqual([
+            'kubectl config get-contexts -o name | while read ctx; do\n  echo "=== $ctx ==="\n  kubectl --context "$ctx" get pods -A\ndone',
+        ]);
+    });
+
+    it("joins if/fi blocks", () => {
+        const lines = ["if [ -f .env ]; then", "  source .env", "fi"];
+        expect(commandsOf(lines)).toEqual(["if [ -f .env ]; then\n  source .env\nfi"]);
+    });
+
+    it("does not join an unclosed block", () => {
+        const lines = ["kubectl get pods -o name | while read p; do", "this is prose", ""];
+        expect(commandsOf(lines)).toEqual(["kubectl get pods -o name | while read p; do"]);
+    });
+});
+
+describe("scanCommands", () => {
+    it("reports every occurrence with its line range", () => {
+        const lines = ["$ kubectl get pods", "output", "docker run \\", "  nginx", "kubectl get pods"];
+        expect(scanCommands(lines)).toEqual([
+            { command: "kubectl get pods", lineIndex: 0, endLineIndex: 0, inFence: false },
+            { command: "docker run \\\n  nginx", lineIndex: 2, endLineIndex: 3, inFence: false },
+            { command: "kubectl get pods", lineIndex: 4, endLineIndex: 4, inFence: false },
+        ]);
     });
 });
 
