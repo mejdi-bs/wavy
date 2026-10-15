@@ -13,10 +13,12 @@ export type DetectedCommand = {
 export type ScanOptions = {
     // terminal width, used to recognize lines soft-wrapped by a TUI
     cols?: number;
-    // Per line, [start, end) string offsets of text drawn in a different
-    // color than the rest of the line. TUIs render markdown inline code that
-    // way (colored, backticks dropped), so these runs stand in for spans.
-    styledRuns?: Array<Array<[number, number]>>;
+    // For a line index, [start, end) string offsets of text drawn in a
+    // different color than the rest of the line. TUIs render markdown inline
+    // code that way (colored, backticks dropped), so these runs stand in for
+    // spans. A callback: reading cell colors is costly and only needed for
+    // the few lines nothing else matched.
+    styledRuns?: (lineIndex: number) => Array<[number, number]>;
 };
 
 export type CommandOccurrence = {
@@ -850,10 +852,6 @@ function acceptsAsCommand(candidate: string, inFence: boolean, fenceLang: string
     return /^[.~/]/.test(firstToken);
 }
 
-// Joins the lines that belong to the command starting at `startLine`: `\`,
-// `&&`, `|` continuations and multi-line compound commands (`while ...; do` up
-// to `done`). An unclosed block is not joined, so a stray `do` cannot swallow
-// the prose that follows it.
 // Heredoc bodies are literal text (blank lines and indentation included) up
 // to the line holding only the delimiter. Without a terminator in range the
 // first line is returned alone rather than swallowing what follows.
@@ -875,6 +873,10 @@ function readHeredoc(
     return { command: candidate, lastLine: startLine };
 }
 
+// Joins the lines that belong to the command starting at `startLine`: `\`,
+// `&&`, `|` continuations and multi-line compound commands (`while ...; do` up
+// to `done`). An unclosed block is not joined, so a stray `do` cannot swallow
+// the prose that follows it.
 function readContinuation(
     lines: string[],
     startLine: number,
@@ -947,6 +949,7 @@ function readSoftWrap(
 ): { command: string; lastLine: number } {
     const firstIndent = leadingIndent(lines[lastLine]);
     const startLine = lastLine;
+    const original = command;
     for (let j = lastLine + 1; j < lines.length; ) {
         const inQuote = hasUnclosedQuote(command);
         if (j - startLine > (inQuote ? MaxQuotedLines : MaxContinuationLines)) {
@@ -996,22 +999,24 @@ function readSoftWrap(
         lastLine = j;
         j++;
     }
+    // a quote that never closes (`echo don't`) is a stray apostrophe, not a
+    // multi-line script: keep the first line alone
+    if (hasUnclosedQuote(command)) {
+        return { command: original, lastLine: startLine };
+    }
     return { command, lastLine };
 }
 
-// The whole body of a shell fence that starts like a script, comments and
-// blank lines included, dedented to its first line. Null when the fence is
-// not a script or is never closed in range.
 function isShellFence(lang: string): boolean {
     return lang == "" || SHELL_FENCE_LANGS.has(lang);
 }
 
-function readFencedScript(
-    lines: string[],
-    fenceLine: number,
-    marker: string,
-    lang: string
-): { command: string; lineIndex: number; endLineIndex: number } | null {
+type FenceBody = { command: string; lineIndex: number; endLineIndex: number; closeLine: number };
+
+// The whole body of a shell fence that starts like a script, comments and
+// blank lines included, dedented to its first line. Null when the fence is
+// not a script or is never closed in range.
+function readFencedScript(lines: string[], fenceLine: number, marker: string, lang: string): FenceBody | null {
     if (!isShellFence(lang)) {
         return null;
     }
@@ -1032,11 +1037,7 @@ function readFencedScript(
 // Body of a code fence from `first` to the last non-blank line before the
 // closing marker, dedented to its first line. Null when the fence is never
 // closed in range: better nothing than a block that swallows the answer.
-function readFenceBody(
-    lines: string[],
-    first: number,
-    marker: string
-): { command: string; lineIndex: number; endLineIndex: number } | null {
+function readFenceBody(lines: string[], first: number, marker: string): FenceBody | null {
     const baseIndent = leadingIndent(lines[first]);
     const body: string[] = [];
     for (let j = first; j < lines.length && j - first <= MaxQuotedLines; j++) {
@@ -1050,6 +1051,7 @@ function readFenceBody(
                 command: finalizeCommand(body.slice(0, last - first + 1).join("\n")),
                 lineIndex: first,
                 endLineIndex: last,
+                closeLine: j,
             };
         }
         body.push(cleanContinuationLine(lines[j], baseIndent));
@@ -1057,11 +1059,7 @@ function readFenceBody(
     return null;
 }
 
-function readCodeBlock(
-    lines: string[],
-    fenceLine: number,
-    marker: string
-): { command: string; lineIndex: number; endLineIndex: number } | null {
+function readCodeBlock(lines: string[], fenceLine: number, marker: string): FenceBody | null {
     let first = fenceLine + 1;
     while (first < lines.length && sanitizeLine(lines[first]).trim() == "") {
         first++;
@@ -1087,16 +1085,21 @@ export function scanCommands(lines: string[], opts?: ScanOptions): CommandOccurr
         const fence = parseFenceMarker(cleaned, inFence);
         if (fence != null) {
             if (!inFence) {
+                // resume after the closing marker, not after the body: blank
+                // lines may sit between them, and re-reading the closing
+                // marker would open a phantom fence over the rest of the text
                 const script = readFencedScript(lines, i, fence.marker[0], fence.info);
                 if (script != null) {
-                    results.push({ ...script, inFence: true });
-                    i = script.endLineIndex + 1;
+                    const { closeLine, ...occ } = script;
+                    results.push({ ...occ, inFence: true });
+                    i = closeLine;
                     continue;
                 }
                 const block = isShellFence(fence.info) ? null : readCodeBlock(lines, i, fence.marker[0]);
                 if (block != null) {
-                    results.push({ ...block, inFence: true, block: { lang: fence.info } });
-                    i = block.endLineIndex + 1;
+                    const { closeLine, ...occ } = block;
+                    results.push({ ...occ, inFence: true, block: { lang: fence.info } });
+                    i = closeLine;
                     continue;
                 }
                 inFence = true;
@@ -1142,9 +1145,8 @@ export function scanCommands(lines: string[], opts?: ScanOptions): CommandOccurr
         }
         // Fences are syntax-highlighted token by token, so color runs are only
         // meaningful in prose, and only when nothing else matched the line.
-        const runs = opts?.styledRuns?.[i];
-        if (results.length == foundBefore && !inFence && !cleaned.includes("`") && runs != null) {
-            for (const [start, end] of runs) {
+        if (results.length == foundBefore && !inFence && !cleaned.includes("`") && opts?.styledRuns != null) {
+            for (const [start, end] of opts.styledRuns(i)) {
                 const run = sanitizeLine(lines[i].slice(start, end)).trim();
                 // TUIs also color file paths and names in prose; a lone word
                 // only counts when it is a known program (`htop`)

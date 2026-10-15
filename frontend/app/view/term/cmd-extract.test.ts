@@ -473,6 +473,24 @@ describe("non-shell code blocks", () => {
     });
 });
 
+describe("fence bookkeeping and stray quotes", () => {
+    it("resumes after the closing marker when blank lines precede it", () => {
+        const lines = ["```python", "print(1)", "", "```", "mytool --sync all", "```bash", "mytool --sync all", "```"];
+        // outside a fence an unknown binary is prose; inside a shell fence it
+        // is a command. A phantom fence opened by the closing marker would
+        // wrongly accept line 4.
+        expect(scanCommands(lines).map((o) => [o.command, o.lineIndex])).toEqual([
+            ["print(1)", 1],
+            ["mytool --sync all", 6],
+        ]);
+    });
+
+    it("does not swallow following lines after a stray apostrophe", () => {
+        const lines = ["```bash", "echo don't stop", "kubectl get pods", "```"];
+        expect(commandsOf(lines)).toEqual(["echo don't stop", "kubectl get pods"]);
+    });
+});
+
 describe("scanCommands", () => {
     it("reports every occurrence with its line range", () => {
         const lines = ["$ kubectl get pods", "output", "docker run \\", "  nginx", "kubectl get pods"];

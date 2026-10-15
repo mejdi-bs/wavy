@@ -112,7 +112,7 @@ describe("inline code rendered as colored text", () => {
             ),
         ]);
         const text = readBufferText(buffer, 0, 1);
-        expect(text.styledRuns[0].map(([a, b]) => text.lines[0].slice(a, b))).toEqual([
+        expect(text.styledRuns(0).map(([a, b]) => text.lines[0].slice(a, b))).toEqual([
             "kubectl get pods -n prod",
             "helm list -A",
         ]);

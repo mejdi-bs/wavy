@@ -15,8 +15,9 @@ export type ViewportText = {
     // first buffer row and row count of each logical (unwrapped) line
     startRows: number[];
     rowCounts: number[];
-    // per logical line, [start, end) offsets of differently colored text
-    styledRuns: Array<Array<[number, number]>>;
+    // per logical line, [start, end) offsets of differently colored text;
+    // computed on demand (it reads every cell of the line) and memoized
+    styledRuns: (lineIndex: number) => Array<[number, number]>;
 };
 
 export type HoverBox = {
@@ -86,9 +87,30 @@ function rowStyledRuns(line: TermTypes.IBufferLine, cell: TermTypes.IBufferCell)
 }
 
 export function readBufferText(buffer: TermTypes.IBuffer, start: number, end: number): ViewportText {
-    const text: ViewportText = { lines: [], startRows: [], rowCounts: [], styledRuns: [] };
-    // test doubles may not implement cells; color runs are then skipped
+    // each logical line remembers its rows and where each row starts in the
+    // joined text, so color runs can be computed later for that line only
+    const rowOffsets: Array<Array<[number, number]>> = [];
+    const memo = new Map<number, Array<[number, number]>>();
+    // test doubles may not implement cells; color runs are then empty
     const cell = typeof buffer.getNullCell == "function" ? buffer.getNullCell() : null;
+    const styledRuns = (lineIndex: number): Array<[number, number]> => {
+        if (cell == null || rowOffsets[lineIndex] == null) {
+            return [];
+        }
+        let runs = memo.get(lineIndex);
+        if (runs == null) {
+            runs = [];
+            for (const [row, shift] of rowOffsets[lineIndex]) {
+                const line = buffer.getLine(row);
+                if (line != null) {
+                    runs.push(...rowStyledRuns(line, cell).map(([a, b]): [number, number] => [a + shift, b + shift]));
+                }
+            }
+            memo.set(lineIndex, runs);
+        }
+        return runs;
+    };
+    const text: ViewportText = { lines: [], startRows: [], rowCounts: [], styledRuns };
     for (let row = Math.max(0, start); row < Math.min(buffer.length, end); row++) {
         const line = buffer.getLine(row);
         if (line == null) {
@@ -98,19 +120,17 @@ export function readBufferText(buffer: TermTypes.IBuffer, start: number, end: nu
         // otherwise column offsets into the joined logical line drift
         const wrapsOn = buffer.getLine(row + 1)?.isWrapped ?? false;
         const lineText = line.translateToString(!wrapsOn);
-        const runs = cell != null ? rowStyledRuns(line, cell) : [];
         const last = text.lines.length - 1;
         if (line.isWrapped && last >= 0) {
-            const shift = text.lines[last].length;
-            text.styledRuns[last].push(...runs.map(([a, b]): [number, number] => [a + shift, b + shift]));
+            rowOffsets[last].push([row, text.lines[last].length]);
             text.lines[last] += lineText;
             text.rowCounts[last]++;
             continue;
         }
+        rowOffsets.push([[row, 0]]);
         text.lines.push(lineText);
         text.startRows.push(row);
         text.rowCounts.push(1);
-        text.styledRuns.push(runs);
     }
     return text;
 }
